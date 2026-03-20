@@ -180,21 +180,27 @@ pub fn dequantize_q4_k(data: &[u8], n: usize) -> Vec<f32> {
             mins[4 + i] = (sc_data[8 + i] >> 4) | ((sc_data[4 + i] >> 6) << 4);
         }
 
-        // Dequantize 256 values from 128 bytes of 4-bit data
+        // Dequantize 256 values from 128 bytes of 4-bit data.
+        // GGML layout: 4 groups of 64 elements. Each group has 2 sub-blocks
+        // sharing 32 bytes: lower nibble → even sub-block, upper nibble → odd.
         let qdata = &data[off + 16..off + 16 + 128];
-        for sb in 0..8 {
-            let sc = d * scales[sb] as f32;
-            let m = dmin * mins[sb] as f32;
-            for j in 0..16 {
-                let byte = qdata[sb * 16 + j];
-                let lo = (byte & 0x0F) as f32;
-                let hi = ((byte >> 4) & 0x0F) as f32;
-                let idx = b * block_size + sb * 32 + j * 2;
-                if idx < n {
-                    out[idx] = lo * sc - m;
+        for group in 0..4 {
+            let sb_even = group * 2;
+            let sb_odd = group * 2 + 1;
+            let sc_even = d * scales[sb_even] as f32;
+            let m_even = dmin * mins[sb_even] as f32;
+            let sc_odd = d * scales[sb_odd] as f32;
+            let m_odd = dmin * mins[sb_odd] as f32;
+
+            for l in 0..32 {
+                let byte = qdata[group * 32 + l];
+                let idx_even = b * block_size + group * 64 + l;
+                let idx_odd = idx_even + 32;
+                if idx_even < n {
+                    out[idx_even] = (byte & 0x0F) as f32 * sc_even - m_even;
                 }
-                if idx + 1 < n {
-                    out[idx + 1] = hi * sc - m;
+                if idx_odd < n {
+                    out[idx_odd] = ((byte >> 4) & 0x0F) as f32 * sc_odd - m_odd;
                 }
             }
         }
@@ -202,12 +208,12 @@ pub fn dequantize_q4_k(data: &[u8], n: usize) -> Vec<f32> {
     out
 }
 
-/// Dequantize Q6_K data to f32.
-/// Q6_K super-block: 256 elements
-///   128 bytes: lower 4 bits of quantized values
-///   64 bytes: upper 2 bits of quantized values
-///   16 bytes: scales (int8) for 16 sub-blocks of 16 elements
-///   2 bytes: f16 d (super-block scale)
+/// Dequantize Q6_K data to f32 (matches GGML reference exactly).
+/// Q6_K super-block: 256 elements = 2 groups of 128
+///   ql[128]: lower 4 bits (shared between lo/hi nibble pairs)
+///   qh[64]: upper 2 bits (packed 4 per byte)
+///   scales[16]: int8 scales for sub-groups of 16 elements
+///   d: f16 super-block scale
 pub fn dequantize_q6_k(data: &[u8], n: usize) -> Vec<f32> {
     let block_size = 256;
     let block_bytes = 210; // 128 + 64 + 16 + 2
@@ -220,38 +226,37 @@ pub fn dequantize_q6_k(data: &[u8], n: usize) -> Vec<f32> {
             break;
         }
 
-        let ql = &data[off..off + 128];       // lower 4 bits
-        let qh = &data[off + 128..off + 192]; // upper 2 bits
-        let sc = &data[off + 192..off + 208];  // int8 scales
+        let mut ql = &data[off..off + 128];
+        let mut qh = &data[off + 128..off + 192];
+        let mut sc = &data[off + 192..off + 208];
         let d = f16_to_f32(u16::from_le_bytes([data[off + 208], data[off + 209]]));
 
-        for k in 0..256 {
-            let idx = b * block_size + k;
-            if idx >= n {
-                break;
+        let base = b * block_size;
+
+        // Process 2 groups of 128 elements each
+        for group in 0..2 {
+            let y_off = base + group * 128;
+            for l in 0..32 {
+                let is = l / 16;
+                let q1 = ((ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4)) as i32 - 32;
+                let q2 = ((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) as i32 - 32;
+                let q3 = ((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) as i32 - 32;
+                let q4 = ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) as i32 - 32;
+
+                let idx0 = y_off + l;
+                let idx1 = y_off + l + 32;
+                let idx2 = y_off + l + 64;
+                let idx3 = y_off + l + 96;
+
+                if idx0 < n { out[idx0] = d * sc[is] as i8 as f32 * q1 as f32; }
+                if idx1 < n { out[idx1] = d * sc[is + 2] as i8 as f32 * q2 as f32; }
+                if idx2 < n { out[idx2] = d * sc[is + 4] as i8 as f32 * q3 as f32; }
+                if idx3 < n { out[idx3] = d * sc[is + 6] as i8 as f32 * q4 as f32; }
             }
-
-            let lo4 = if k < 128 {
-                (ql[k] & 0x0F) as i32
-            } else {
-                ((ql[k - 128] >> 4) & 0x0F) as i32
-            };
-
-            let hi2_byte_idx = k / 4;
-            let hi2_shift = (k % 4) * 2;
-            let hi2 = if hi2_byte_idx < 64 {
-                ((qh[hi2_byte_idx] >> hi2_shift) & 0x03) as i32
-            } else {
-                0
-            };
-
-            let q = lo4 | (hi2 << 4); // 6-bit value (0-63)
-            let q_signed = q - 32;      // center around 0
-
-            let scale_idx = k / 16;
-            let scale = sc[scale_idx] as i8 as f32;
-
-            out[idx] = d * scale * q_signed as f32;
+            // Advance pointers for next group
+            ql = &ql[64..];
+            qh = &qh[32..];
+            sc = &sc[8..];
         }
     }
     out
@@ -501,6 +506,10 @@ pub fn forward(
     gpu.free_tensor(logits)?;
 
     Ok(logits_data)
+}
+
+pub fn apply_rope_cpu_pub(data: &mut [f32], n_heads: usize, head_dim: usize, pos: usize) {
+    apply_rope_cpu(data, n_heads, head_dim, pos);
 }
 
 fn apply_rope_cpu(data: &mut [f32], n_heads: usize, head_dim: usize, pos: usize) {
