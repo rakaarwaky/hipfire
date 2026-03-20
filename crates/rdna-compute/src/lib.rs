@@ -1,5 +1,9 @@
-//! rdna-compute: Kernel compilation, buffer management, dispatch for RDNA GPUs
+//! rdna-compute: Kernel compilation, caching, and dispatch for RDNA GPUs.
 
-pub fn init() {
-    todo!("Phase 4: implement compute dispatch")
-}
+mod compiler;
+mod dispatch;
+mod kernels;
+
+pub use compiler::KernelCompiler;
+pub use dispatch::{DType, Gpu, GpuTensor};
+pub use kernels::GEMV_SRC;
