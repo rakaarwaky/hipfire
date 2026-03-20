@@ -474,6 +474,54 @@ impl Gpu {
         }
     }
 
+    /// GPU-side RoPE (rotary positional embedding) applied in-place to Q and K.
+    pub fn rope_f32(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        pos: usize,
+        n_heads_q: usize,
+        n_heads_k: usize,
+        head_dim: usize,
+        freq_base: f32,
+    ) -> HipResult<()> {
+        self.ensure_kernel("rope", kernels::ROPE_SRC, "rope_f32")?;
+        let func = &self.functions["rope_f32"];
+
+        let mut q_ptr = q.buf.as_ptr();
+        let mut k_ptr = k.buf.as_ptr();
+        let mut pos_val = pos as i32;
+        let mut nhq = n_heads_q as i32;
+        let mut nhk = n_heads_k as i32;
+        let mut hd = head_dim as i32;
+        let mut fb = freq_base;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q_ptr as *mut _ as *mut c_void,
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut pos_val as *mut _ as *mut c_void,
+            &mut nhq as *mut _ as *mut c_void,
+            &mut nhk as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut fb as *mut _ as *mut c_void,
+        ];
+
+        let half = (head_dim / 2) as u32;
+        let block = 256u32.min(half);
+        let grid = (half + block - 1) / block;
+
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [block, 1, 1],
+                0,
+                None,
+                &mut params,
+            )
+        }
+    }
+
     /// GPU-side GQA attention.
     pub fn attention_f32(
         &mut self,

@@ -497,10 +497,10 @@ pub fn forward(
         weight_gemv(gpu, &layer.wk, &tmp, &k)?;
         weight_gemv(gpu, &layer.wv, &tmp, &v)?;
 
-        // QK normalization (Qwen3: RMSNorm per-head before RoPE)
-        let mut q_data = gpu.download_f32(&q)?;
-        let mut k_data = gpu.download_f32(&k)?;
+        // QK normalization (Qwen3: still CPU-side for now)
         if config.has_qk_norm {
+            let mut q_data = gpu.download_f32(&q)?;
+            let mut k_data = gpu.download_f32(&k)?;
             if let Some(ref qn) = layer.q_norm {
                 let qn_w = gpu.download_f32(qn)?;
                 per_head_rmsnorm_cpu(&mut q_data, &qn_w, n_heads, head_dim, config.norm_eps);
@@ -509,36 +509,48 @@ pub fn forward(
                 let kn_w = gpu.download_f32(kn)?;
                 per_head_rmsnorm_cpu(&mut k_data, &kn_w, n_kv_heads, head_dim, config.norm_eps);
             }
+            // Re-upload normalized Q and K
+            let q2 = gpu.upload_f32(&q_data, &[q_dim])?;
+            let k2 = gpu.upload_f32(&k_data, &[kv_dim])?;
+            // Copy back into q and k buffers using D2D
+            gpu.hip.memcpy_dtod(&q.buf, &q2.buf, q_dim * 4)?;
+            gpu.hip.memcpy_dtod(&k.buf, &k2.buf, kv_dim * 4)?;
+            gpu.free_tensor(q2)?;
+            gpu.free_tensor(k2)?;
         }
 
-        // RoPE (CPU for now — simple and correct)
-        apply_rope_cpu(&mut q_data, n_heads, head_dim, pos, config.rope_freq_base);
-        apply_rope_cpu(&mut k_data, n_kv_heads, head_dim, pos, config.rope_freq_base);
+        // RoPE — GPU-side, no CPU round-trip
+        gpu.rope_f32(&q, &k, pos, n_heads, n_kv_heads, head_dim, config.rope_freq_base)?;
 
-        // Upload RoPE'd Q, re-upload K
-        let q_rope = gpu.upload_f32(&q_data, &[q_dim])?;
-        gpu.free_tensor(q)?;
-
-        // Store K, V in GPU cache
-        let v_data = gpu.download_f32(&v)?;
-        kv_cache.store_kv(gpu, layer_idx, pos, &k_data, &v_data)?;
+        // Store K, V in GPU cache — pure D2D copy, no CPU involvement
+        let cache_byte_offset = pos * kv_dim * 4;
+        gpu.hip.memcpy_dtod_at(
+            &kv_cache.k_gpu[layer_idx].buf, cache_byte_offset,
+            &k.buf, 0,
+            kv_dim * 4,
+        )?;
+        gpu.hip.memcpy_dtod_at(
+            &kv_cache.v_gpu[layer_idx].buf, cache_byte_offset,
+            &v.buf, 0,
+            kv_dim * 4,
+        )?;
         gpu.free_tensor(k)?;
         gpu.free_tensor(v)?;
 
         // GPU-side attention
         let attn_gpu = gpu.zeros(&[q_dim], DType::F32)?;
         gpu.attention_f32(
-            &q_rope,
+            &q,
             &kv_cache.k_gpu[layer_idx],
             &kv_cache.v_gpu[layer_idx],
             &attn_gpu,
-            pos + 1, // seq_len = positions 0..pos inclusive
+            pos + 1,
             n_heads,
             n_kv_heads,
             head_dim,
             kv_cache.max_seq,
         )?;
-        gpu.free_tensor(q_rope)?;
+        gpu.free_tensor(q)?;
 
         // Output projection: o = Wo * attn_out
         let o = gpu.zeros(&[dim], DType::F32)?;

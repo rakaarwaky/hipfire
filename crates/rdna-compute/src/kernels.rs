@@ -444,18 +444,21 @@ pub const ROPE_SRC: &str = r#"
 extern "C" __global__ void rope_f32(
     float* __restrict__ q,
     float* __restrict__ k,
-    int pos, int dim, int head_dim
+    int pos,
+    int n_heads_q,
+    int n_heads_k,
+    int head_dim,
+    float freq_base
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int half = head_dim / 2;
     if (i >= half) return;
 
-    float freq = 1.0f / powf(10000.0f, (float)(2 * i) / (float)head_dim);
+    float freq = 1.0f / powf(freq_base, (float)(2 * i) / (float)head_dim);
     float val = (float)pos * freq;
     float cos_val = cosf(val);
     float sin_val = sinf(val);
 
-    int n_heads_q = dim / head_dim;
     for (int h = 0; h < n_heads_q; h++) {
         int base = h * head_dim;
         float q0 = q[base + i];
@@ -464,7 +467,6 @@ extern "C" __global__ void rope_f32(
         q[base + i + half] = q0 * sin_val + q1 * cos_val;
     }
 
-    int n_heads_k = dim / head_dim;
     for (int h = 0; h < n_heads_k; h++) {
         int base = h * head_dim;
         float k0 = k[base + i];
