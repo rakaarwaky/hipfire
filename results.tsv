@@ -1,0 +1,2 @@
+experiment	task	kernel	tok_s	throughput	pct_peak	correctness	peak_vram_mb	description	kept
+0	baseline	all	7.2	-	-	PASS	4300	TinyLlama 1.1B F32 dequant, CPU attention, 140ms/tok avg	YES
