@@ -442,6 +442,29 @@ impl Gpu {
         unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, None, &mut params) }
     }
 
+    /// out = silu(gate) * up — fused to avoid intermediate buffer
+    pub fn silu_mul_f32(&mut self, gate: &GpuTensor, up: &GpuTensor, out: &GpuTensor) -> HipResult<()> {
+        self.ensure_kernel("silu_mul", kernels::SILU_MUL_SRC, "silu_mul_f32")?;
+        let func = &self.functions["silu_mul_f32"];
+
+        let n = gate.numel() as i32;
+        let mut gate_ptr = gate.buf.as_ptr();
+        let mut up_ptr = up.buf.as_ptr();
+        let mut out_ptr = out.buf.as_ptr();
+        let mut n_val = n;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut gate_ptr as *mut _ as *mut c_void,
+            &mut up_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+
+        let block = 256u32;
+        let grid = ((n as u32) + block - 1) / block;
+        unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, None, &mut params) }
+    }
+
     /// In-place softmax over last dimension
     pub fn softmax_f32(&mut self, x: &GpuTensor) -> HipResult<()> {
         self.ensure_kernel("softmax", kernels::SOFTMAX_SRC, "softmax_f32")?;

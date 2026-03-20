@@ -572,14 +572,10 @@ pub fn forward(
         weight_gemv(gpu, &layer.w_gate, &tmp, &gate)?;
         weight_gemv(gpu, &layer.w_up, &tmp, &up)?;
 
-        // SiLU(gate) * up
-        let gate_act = gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?;
-        gpu.silu_f32(&gate, &gate_act)?;
-        gpu.free_tensor(gate)?;
-
+        // Fused SiLU(gate) * up — saves one kernel launch + intermediate buffer
         let ffn_hidden = gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?;
-        gpu.mul_f32(&gate_act, &up, &ffn_hidden)?;
-        gpu.free_tensor(gate_act)?;
+        gpu.silu_mul_f32(&gate, &up, &ffn_hidden)?;
+        gpu.free_tensor(gate)?;
         gpu.free_tensor(up)?;
 
         // Down projection

@@ -402,6 +402,25 @@ extern "C" __global__ void silu_f32(
 }
 "#;
 
+/// Fused SiLU(gate) * up: out[i] = silu(gate[i]) * up[i]
+/// Saves one kernel launch + one intermediate buffer.
+pub const SILU_MUL_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void silu_mul_f32(
+    const float* __restrict__ gate,
+    const float* __restrict__ up,
+    float* __restrict__ out,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = gate[i];
+        out[i] = (v / (1.0f + expf(-v))) * up[i];
+    }
+}
+"#;
+
 /// Softmax over last dimension (one block per row)
 pub const SOFTMAX_SRC: &str = r#"
 #include <hip/hip_runtime.h>
