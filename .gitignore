@@ -16,3 +16,6 @@ results.tsv
 *.gguf
 *.hfq
 *.safetensors
+
+# Tool configs
+.serena/
