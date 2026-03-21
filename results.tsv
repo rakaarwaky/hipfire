@@ -22,3 +22,4 @@ experiment	task	kernel	tok_s	throughput	pct_peak	correctness	peak_vram_mb	descri
 20	phase5	baseline	33.7	-	-	PASS	~5400	Phase 5 baseline: Qwen3-8B Q4K-all HFQ, thermodynamics prompt, 856 tok	YES
 21	phase5-task1	pos_buf	36.0	-	-	PASS	~5400	All kernels use GPU pos_buf: rope, attention, kv_cache_write. 640tok thermo prompt. +6.8%	YES
 22	phase5-task2	hip_graph	-	-	-	HANG	-	HIP Graph APIs hang on gfx1010+HSA_OVERRIDE. hipStreamBeginCapture never returns. RDNA1 unsupported.	NO
+23	phase5-hfq4	gemv_hfq4g128	-	231.3 GB/s	51.6	PASS	-	HFQ4-G128: 14 VGPRs (vs Q4K 39), 122us at 12288x4096. Slower than Q4K 263 GB/s despite 2x occupancy.	NO
