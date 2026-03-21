@@ -1,0 +1,23 @@
+experiment	task	kernel	tok_s	throughput	pct_peak	correctness	peak_vram_mb	description	kept
+0	baseline	all	7.2	-	-	PASS	4300	TinyLlama 1.1B F32 dequant, CPU attention, 140ms/tok avg	YES
+1	task1	all	3.4	-	-	PASS	-	Qwen3-0.6B Q8_0 VERIFIED correct — matches ollama output word-for-word	YES
+2	task2	gemv_q4k	-	26.9 GB/s	6.0	PASS	-	v4: native _Float16, 1.18x faster than F32 at 2048x2048	NO
+3	task2	gemv_q4k	-	52.4 GB/s	11.7	PASS	-	v5: warp shuffle reduction, 2.26x faster than F32 at attn_q, 35-52 GB/s range	YES
+4	task2	integration	7.2	-	-	PASS	570	quantized weights on GPU: VRAM 4300→570MB, load 3.1→0.5s, same tok/s	YES
+5	task2	integration	0.8	-	-	PASS	~5000	QWEN3-8B RUNNING on RX 5700 XT! Correct <think> output. 0.8 tok/s.	YES
+6	task3	attention	7.1	-	-	PASS	1900	GPU attention + GPU KV cache. Identical output. 140ms/tok. CPU RoPE still bottleneck.	YES
+7	phase3	gemv_q4k	47.9	55.9 GB/s	12.5	PASS	-	phase 3 baseline: v5 kernel, 42.4 us/call at 2048x2048	YES
+8	phase3	gemv_q4k	95.6	177.6 GB/s	39.6	PASS	-	exp 1: single-warp (32 threads), 8 elem/thread. 3.2x bandwidth gain	YES
+9	phase3	gemv_q4k	-	133.8 GB/s	29.9	PASS	-	exp 2: multi-row (4 rows/block) REGRESSION — fewer waves hurts	NO
+10	phase3	gemv_q4k	-	176.9 GB/s	39.5	PASS	-	exp 3: uint32 qs loads — no improvement, scattered x reads cancel out	NO
+11	phase3	gemv_q4k	-	110.8 GB/s	24.7	PASS	-	exp 3b: dp4a+Q8_1 path — RDNA1 fallback slower than float path	NO
+12	phase3	gemv_q4k	-	178.8 GB/s	39.9	PASS	-	exp 4: __launch_bounds__(32,20) — marginal +0.7% improvement	YES
+13	phase3	forward	105.3	-	-	PASS	-	exp 5: eliminate memset from forward pass, alloc_tensor vs zeros	YES
+14	phase3	silu_mul	106.0	-	-	PASS	-	exp 6: fused silu_mul kernel — saves 22 launches per token	YES
+15	phase3	add_inplace	106.1	-	-	PASS	-	exp 7: in-place residual add — saves 44 allocs per token	YES
+16	ryrx	tiered_hfq	7.4	-	-	PASS	~2500	Qwen3-8B tiered: attn VRAM + FFN zero-copy PCIe BAR (41.5 baseline)	YES
+17	ryrx	zerocopy_gguf	29.4	-	-	PASS	~100	TinyLlama all zero-copy PCIe BAR (108 baseline, 4 managed)	YES
+18	quant_matrix	Q4K_all_gguf	40.1	-	-	GARBAGE	~5000	Q4_K everything via GGUF --no-promote: coherent ~50 tok then collapse	NO
+19	quant_matrix	Q4K_q8embed_hfq	40.9	-	-	GARBAGE	~5200	Q4_K attn/FFN + Q8 embed/output via HFQ: Q4_K attention degrades after ~60 tok	NO
+20	phase5	baseline	33.7	-	-	PASS	~5400	Phase 5 baseline: Qwen3-8B Q4K-all HFQ, thermodynamics prompt, 856 tok	YES
+21	phase5-task1	pos_buf	36.0	-	-	PASS	~5400	All kernels use GPU pos_buf: rope, attention, kv_cache_write. 640tok thermo prompt. +6.8%	YES

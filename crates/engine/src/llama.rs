@@ -675,6 +675,7 @@ pub struct ForwardScratch {
     pub ffn_out: GpuTensor,
     pub logits: GpuTensor,
     pub sample_buf: GpuTensor,
+    pub pos_buf: hip_bridge::DeviceBuffer,
 }
 
 impl ForwardScratch {
@@ -696,6 +697,7 @@ impl ForwardScratch {
             ffn_out: gpu.alloc_tensor(&[dim], DType::F32)?,
             logits: gpu.alloc_tensor(&[config.vocab_size], DType::F32)?,
             sample_buf: gpu.alloc_tensor(&[2], DType::F32)?,
+            pos_buf: gpu.hip.malloc(4)?,  // single i32
         })
     }
 }
@@ -719,6 +721,10 @@ pub fn forward_scratch(
     let n_kv_heads = config.n_kv_heads;
     let head_dim = config.head_dim;
     let kv_dim = n_kv_heads * head_dim;
+
+    // Upload pos to GPU buffer (4 bytes)
+    let pos_i32 = pos as i32;
+    gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
 
     // Embedding lookup
     match weights.embd_format {
@@ -753,15 +759,14 @@ pub fn forward_scratch(
             }
         }
 
-        gpu.rope_f32(&scratch.q, &scratch.k, pos, n_heads, n_kv_heads, head_dim, config.rope_freq_base)?;
+        gpu.rope_f32(&scratch.q, &scratch.k, &scratch.pos_buf, n_heads, n_kv_heads, head_dim, config.rope_freq_base)?;
 
-        let cache_byte_offset = pos * kv_dim * 4;
-        gpu.hip.memcpy_dtod_at(&kv_cache.k_gpu[layer_idx].buf, cache_byte_offset, &scratch.k.buf, 0, kv_dim * 4)?;
-        gpu.hip.memcpy_dtod_at(&kv_cache.v_gpu[layer_idx].buf, cache_byte_offset, &scratch.v.buf, 0, kv_dim * 4)?;
+        gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, kv_dim)?;
+        gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, kv_dim)?;
 
         gpu.attention_f32(
             &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-            &scratch.attn_out, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
+            &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
         )?;
 
         weight_gemv(gpu, &layer.wo, &scratch.attn_out, &scratch.o)?;
@@ -832,6 +837,11 @@ pub fn forward(
     let ffn_hidden = gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?;
     let ffn_out = gpu.alloc_tensor(&[dim], DType::F32)?;
 
+    // Upload pos to GPU buffer (4 bytes)
+    let pos_buf = gpu.hip.malloc(4)?;
+    let pos_i32 = pos as i32;
+    gpu.hip.memcpy_htod(&pos_buf, &pos_i32.to_ne_bytes())?;
+
     for layer_idx in 0..config.n_layers {
         let layer = &weights.layers[layer_idx];
 
@@ -866,27 +876,20 @@ pub fn forward(
             }
         }
 
-        // RoPE — GPU-side, no CPU round-trip
-        gpu.rope_f32(&q, &k, pos, n_heads, n_kv_heads, head_dim, config.rope_freq_base)?;
+        // RoPE — GPU-side, reads pos from GPU buffer
+        gpu.rope_f32(&q, &k, &pos_buf, n_heads, n_kv_heads, head_dim, config.rope_freq_base)?;
 
-        // Store K, V in GPU cache — pure D2D copy, no CPU involvement
-        let cache_byte_offset = pos * kv_dim * 4;
-        gpu.hip.memcpy_dtod_at(
-            &kv_cache.k_gpu[layer_idx].buf, cache_byte_offset,
-            &k.buf, 0,
-            kv_dim * 4,
-        )?;
-        gpu.hip.memcpy_dtod_at(
-            &kv_cache.v_gpu[layer_idx].buf, cache_byte_offset,
-            &v.buf, 0,
-            kv_dim * 4,
-        )?;
+        // Store K, V in GPU cache — GPU-side copy using pos from GPU buffer
+        gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &k, &pos_buf, kv_dim)?;
+        gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &v, &pos_buf, kv_dim)?;
+
         // GPU-side attention
         gpu.attention_f32(
             &q,
             &kv_cache.k_gpu[layer_idx],
             &kv_cache.v_gpu[layer_idx],
             &attn_out,
+            &pos_buf,
             pos + 1,
             n_heads,
             n_kv_heads,
@@ -1008,6 +1011,11 @@ fn forward_logits_gpu(
     let ffn_hidden = gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?;
     let ffn_out = gpu.alloc_tensor(&[dim], DType::F32)?;
 
+    // Upload pos to GPU buffer (4 bytes)
+    let pos_buf = gpu.hip.malloc(4)?;
+    let pos_i32 = pos as i32;
+    gpu.hip.memcpy_htod(&pos_buf, &pos_i32.to_ne_bytes())?;
+
     for layer_idx in 0..config.n_layers {
         let layer = &weights.layers[layer_idx];
         gpu.rmsnorm_f32(&x, &layer.attn_norm, &tmp, config.norm_eps)?;
@@ -1033,21 +1041,14 @@ fn forward_logits_gpu(
             }
         }
 
-        gpu.rope_f32(&q, &k, pos, n_heads, n_kv_heads, head_dim, config.rope_freq_base)?;
+        gpu.rope_f32(&q, &k, &pos_buf, n_heads, n_kv_heads, head_dim, config.rope_freq_base)?;
 
-        let cache_byte_offset = pos * kv_dim * 4;
-        gpu.hip.memcpy_dtod_at(
-            &kv_cache.k_gpu[layer_idx].buf, cache_byte_offset,
-            &k.buf, 0, kv_dim * 4,
-        )?;
-        gpu.hip.memcpy_dtod_at(
-            &kv_cache.v_gpu[layer_idx].buf, cache_byte_offset,
-            &v.buf, 0, kv_dim * 4,
-        )?;
+        gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &k, &pos_buf, kv_dim)?;
+        gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &v, &pos_buf, kv_dim)?;
 
         gpu.attention_f32(
             &q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-            &attn_out, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
+            &attn_out, &pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
         )?;
 
         weight_gemv(gpu, &layer.wo, &attn_out, &o)?;

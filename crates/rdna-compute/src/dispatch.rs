@@ -972,11 +972,12 @@ impl Gpu {
     }
 
     /// GPU-side RoPE (rotary positional embedding) applied in-place to Q and K.
+    /// pos_buf: GPU buffer containing a single i32 position value.
     pub fn rope_f32(
         &mut self,
         q: &GpuTensor,
         k: &GpuTensor,
-        pos: usize,
+        pos_buf: &DeviceBuffer,
         n_heads_q: usize,
         n_heads_k: usize,
         head_dim: usize,
@@ -987,7 +988,7 @@ impl Gpu {
 
         let mut q_ptr = q.buf.as_ptr();
         let mut k_ptr = k.buf.as_ptr();
-        let mut pos_val = pos as i32;
+        let mut pos_ptr = pos_buf.as_ptr();
         let mut nhq = n_heads_q as i32;
         let mut nhk = n_heads_k as i32;
         let mut hd = head_dim as i32;
@@ -996,7 +997,7 @@ impl Gpu {
         let mut params: Vec<*mut c_void> = vec![
             &mut q_ptr as *mut _ as *mut c_void,
             &mut k_ptr as *mut _ as *mut c_void,
-            &mut pos_val as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
             &mut nhq as *mut _ as *mut c_void,
             &mut nhk as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void,
@@ -1020,13 +1021,16 @@ impl Gpu {
     }
 
     /// GPU-side GQA attention.
+    /// pos_buf: GPU buffer with single i32 position. Kernel computes seq_len = pos_buf[0] + 1.
+    /// seq_len_hint: host-side seq_len for shared memory sizing (= pos + 1).
     pub fn attention_f32(
         &mut self,
         q: &GpuTensor,
         k_cache: &GpuTensor,
         v_cache: &GpuTensor,
         out: &GpuTensor,
-        seq_len: usize,
+        pos_buf: &DeviceBuffer,
+        seq_len_hint: usize,
         n_heads: usize,
         n_kv_heads: usize,
         head_dim: usize,
@@ -1040,7 +1044,7 @@ impl Gpu {
         let mut k_ptr = k_cache.buf.as_ptr();
         let mut v_ptr = v_cache.buf.as_ptr();
         let mut out_ptr = out.buf.as_ptr();
-        let mut seq_val = seq_len as i32;
+        let mut pos_ptr = pos_buf.as_ptr();
         let mut nh = n_heads as i32;
         let mut nkv = n_kv_heads as i32;
         let mut hd = head_dim as i32;
@@ -1052,7 +1056,7 @@ impl Gpu {
             &mut k_ptr as *mut _ as *mut c_void,
             &mut v_ptr as *mut _ as *mut c_void,
             &mut out_ptr as *mut _ as *mut c_void,
-            &mut seq_val as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
             &mut nh as *mut _ as *mut c_void,
             &mut nkv as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void,
@@ -1060,8 +1064,8 @@ impl Gpu {
             &mut sc as *mut _ as *mut c_void,
         ];
 
-        let block_size = (seq_len.max(head_dim) as u32).next_power_of_two().min(256);
-        let shared_mem = ((seq_len + block_size as usize) * 4) as u32;
+        let block_size = (seq_len_hint.max(head_dim) as u32).next_power_of_two().min(256);
+        let shared_mem = ((seq_len_hint + block_size as usize) * 4) as u32;
 
         unsafe {
             self.hip.launch_kernel(
@@ -1069,6 +1073,44 @@ impl Gpu {
                 [n_heads as u32, 1, 1],
                 [block_size, 1, 1],
                 shared_mem,
+                None,
+                &mut params,
+            )
+        }
+    }
+
+    /// GPU-side KV cache write. Copies kv_dim floats from src to dst[pos_buf[0] * kv_dim].
+    pub fn kv_cache_write(
+        &mut self,
+        dst: &GpuTensor,
+        src: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        kv_dim: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("kv_cache_write", kernels::KV_CACHE_WRITE_SRC, "kv_cache_write")?;
+        let func = &self.functions["kv_cache_write"];
+
+        let mut dst_ptr = dst.buf.as_ptr();
+        let mut src_ptr = src.buf.as_ptr();
+        let mut pos_ptr = pos_buf.as_ptr();
+        let mut kd = kv_dim as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut dst_ptr as *mut _ as *mut c_void,
+            &mut src_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
+            &mut kd as *mut _ as *mut c_void,
+        ];
+
+        let block = 256u32;
+        let grid = (kv_dim as u32 + block - 1) / block;
+
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [block, 1, 1],
+                0,
                 None,
                 &mut params,
             )

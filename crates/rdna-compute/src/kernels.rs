@@ -685,7 +685,7 @@ pub const ROPE_SRC: &str = r#"
 extern "C" __global__ void rope_f32(
     float* __restrict__ q,
     float* __restrict__ k,
-    int pos,
+    const int* __restrict__ pos_buf,
     int n_heads_q,
     int n_heads_k,
     int head_dim,
@@ -695,6 +695,7 @@ extern "C" __global__ void rope_f32(
     int half = head_dim / 2;
     if (i >= half) return;
 
+    int pos = pos_buf[0];
     float freq = 1.0f / powf(freq_base, (float)(2 * i) / (float)head_dim);
     float val = (float)pos * freq;
     float cos_val = cosf(val);
@@ -730,13 +731,14 @@ extern "C" __global__ void attention_f32(
     const float* __restrict__ k_cache,    // [max_seq * n_kv_heads * head_dim]
     const float* __restrict__ v_cache,    // [max_seq * n_kv_heads * head_dim]
     float* __restrict__ out,              // [n_heads * head_dim]
-    int seq_len,        // number of positions cached (including current)
+    const int* __restrict__ pos_buf,      // GPU buffer: seq_len = pos_buf[0] + 1
     int n_heads,
     int n_kv_heads,
     int head_dim,
     int max_seq,        // max sequence length (stride for cache indexing)
     float scale         // 1/sqrt(head_dim)
 ) {
+    int seq_len = pos_buf[0] + 1;
     extern __shared__ float sdata[];
 
     const int h = blockIdx.x;  // query head index
@@ -811,6 +813,24 @@ extern "C" __global__ void attention_f32(
         }
         out_head[d] = val;
     }
+}
+"#;
+
+/// GPU-side KV cache write using pos from a GPU buffer.
+/// Copies kv_dim floats from src to dst at offset pos_buf[0] * kv_dim.
+pub const KV_CACHE_WRITE_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void kv_cache_write(
+    float* __restrict__ dst,          // cache: [max_seq * kv_dim]
+    const float* __restrict__ src,    // current KV: [kv_dim]
+    const int* __restrict__ pos_buf,  // position buffer
+    int kv_dim
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= kv_dim) return;
+    int pos = pos_buf[0];
+    dst[pos * kv_dim + i] = src[i];
 }
 "#;
 
