@@ -29,13 +29,14 @@ fn main() {
         .map(|i| args[i + 1].parse().unwrap_or(64)).unwrap_or(64);
     let use_q4kv = args.iter().any(|a| a == "--q4kv");
     let use_q8kv = args.iter().any(|a| a == "--q8kv");
+    let use_int8kv = args.iter().any(|a| a == "--int8kv");
 
     // Collect prompt text (skip flags)
     let mut prompt_parts = Vec::new();
     let mut skip_next = false;
     for (_i, a) in args.iter().enumerate().skip(2) {
         if skip_next { skip_next = false; continue; }
-        if a == "--temp" || a == "--debug" || a == "--q4kv" || a == "--q8kv" || a == "--repeat-penalty" || a == "--repeat-window" {
+        if a == "--temp" || a == "--debug" || a == "--q4kv" || a == "--q8kv" || a == "--int8kv" || a == "--repeat-penalty" || a == "--repeat-window" {
             if a == "--temp" || a == "--repeat-penalty" || a == "--repeat-window" { skip_next = true; }
             continue;
         }
@@ -103,8 +104,11 @@ fn main() {
 
     // KV cache
     let kv_seq_len = config.max_seq_len.min(2048);
-    let mut kv_cache = if use_q8kv {
-        eprintln!("KV cache: Q8 quantized (3.88x compression)");
+    let mut kv_cache = if use_int8kv {
+        eprintln!("KV cache: INT8 with separate scales (3.88x compression)");
+        KvCache::new_gpu_int8(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len).unwrap()
+    } else if use_q8kv {
+        eprintln!("KV cache: Q8_0 quantized (3.76x compression)");
         KvCache::new_gpu_q8(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len).unwrap()
     } else if use_q4kv {
         eprintln!("KV cache: HFQ4 quantized (3.56x compression)");

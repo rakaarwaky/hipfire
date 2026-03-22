@@ -1747,6 +1747,145 @@ extern "C" __global__ void fused_gate_up_hfq4g256(
 }
 "#;
 
+/// INT8 KV with separate scale array. Contiguous int8 values, one f32 scale per head.
+/// Keys: [max_seq × n_kv_heads × head_dim] int8, Scales: [max_seq × n_kv_heads] f32.
+/// Write: one warp per head, find amax via shuffle, quantize 4 elements per thread.
+pub const KV_CACHE_WRITE_INT8_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void kv_cache_write_int8(
+    signed char* __restrict__ dst_vals,   // [max_seq × kv_dim] int8
+    float* __restrict__ dst_scales,       // [max_seq × n_kv_heads] f32
+    const float* __restrict__ src,        // [kv_dim] FP32
+    const int* __restrict__ pos_buf,
+    int n_kv_heads,
+    int head_dim
+) {
+    const int h = blockIdx.x;
+    if (h >= n_kv_heads) return;
+    const int tid = threadIdx.x;
+    const int pos = pos_buf[0];
+    const int kv_dim = n_kv_heads * head_dim;
+
+    const float* head_src = src + h * head_dim;
+
+    // Find max absolute value via warp shuffle (head_dim=128, 32 threads, 4 per thread)
+    float amax = 0.0f;
+    for (int i = tid; i < head_dim; i += 32) {
+        amax = fmaxf(amax, fabsf(head_src[i]));
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        amax = fmaxf(amax, __shfl_xor(amax, offset));
+
+    float scale = amax / 127.0f;
+    float inv_scale = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+
+    // Write scale (lane 0)
+    if (tid == 0) {
+        dst_scales[pos * n_kv_heads + h] = scale;
+    }
+
+    // Quantize and write contiguous int8
+    signed char* out = dst_vals + pos * kv_dim + h * head_dim;
+    for (int i = tid; i < head_dim; i += 32) {
+        int q = __float2int_rn(head_src[i] * inv_scale);
+        q = max(-127, min(127, q));
+        out[i] = (signed char)q;
+    }
+}
+"#;
+
+/// Attention with INT8 KV (separate scale array). Clean indexed access, no block math.
+pub const ATTENTION_INT8_KV_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void attention_int8_kv(
+    const float* __restrict__ q,
+    const signed char* __restrict__ k_vals,   // [max_seq × kv_dim] int8
+    const float* __restrict__ k_scales,       // [max_seq × n_kv_heads] f32
+    const signed char* __restrict__ v_vals,   // [max_seq × kv_dim] int8
+    const float* __restrict__ v_scales,       // [max_seq × n_kv_heads] f32
+    float* __restrict__ out,
+    const int* __restrict__ pos_buf,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int max_seq,
+    float scale_attn
+) {
+    int seq_len = pos_buf[0] + 1;
+    extern __shared__ float sdata[];
+
+    const int h = blockIdx.x;
+    if (h >= n_heads) return;
+
+    const int kv_group = n_heads / n_kv_heads;
+    const int kv_h = h / kv_group;
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+    const int kv_dim = n_kv_heads * head_dim;
+
+    const float* q_head = q + h * head_dim;
+
+    float* scores = sdata;
+    float* workspace = sdata + seq_len;
+
+    // Phase 1: Q @ K^T
+    float local_max = -1e30f;
+    for (int t = tid; t < seq_len; t += nthreads) {
+        float k_scale = k_scales[t * n_kv_heads + kv_h];
+        const signed char* k_head = k_vals + t * kv_dim + kv_h * head_dim;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++) {
+            dot += q_head[d] * (k_scale * (float)k_head[d]);
+        }
+        float s = dot * scale_attn;
+        scores[t] = s;
+        local_max = fmaxf(local_max, s);
+    }
+
+    workspace[tid] = local_max;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) workspace[tid] = fmaxf(workspace[tid], workspace[tid + s]);
+        __syncthreads();
+    }
+    float max_val = workspace[0];
+    __syncthreads();
+
+    float local_sum = 0.0f;
+    for (int t = tid; t < seq_len; t += nthreads) {
+        float e = expf(scores[t] - max_val);
+        scores[t] = e;
+        local_sum += e;
+    }
+    workspace[tid] = local_sum;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) workspace[tid] += workspace[tid + s];
+        __syncthreads();
+    }
+    float sum_val = workspace[0];
+    __syncthreads();
+
+    for (int t = tid; t < seq_len; t += nthreads) {
+        scores[t] /= sum_val;
+    }
+    __syncthreads();
+
+    // Phase 2: weighted V sum
+    float* out_head = out + h * head_dim;
+    for (int d = tid; d < head_dim; d += nthreads) {
+        float val = 0.0f;
+        for (int t = 0; t < seq_len; t++) {
+            float v_scale = v_scales[t * n_kv_heads + kv_h];
+            val += scores[t] * (v_scale * (float)v_vals[t * kv_dim + kv_h * head_dim + d]);
+        }
+        out_head[d] = val;
+    }
+}
+"#;
+
 /// Quantize KV vector to Q8_0 format (same as GGML Q8_0 / existing GEMV kernels).
 /// Block: [f16 scale (2B)][int8 × 32 (32B)] = 34 bytes per 32 elements.
 /// head_dim=128 → 4 blocks × 34 = 136 bytes per head.
