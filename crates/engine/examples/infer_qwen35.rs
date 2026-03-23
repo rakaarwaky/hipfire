@@ -94,6 +94,10 @@ fn main() {
         let text = tokenizer.decode(&[*id as u32]);
         eprintln!("  id={id} logit={val:.4} text={text:?}");
     }
+    // Check specific tokens
+    eprintln!("logit[248068] (<think>): {:.4}", logits.get(248068).unwrap_or(&f32::NAN));
+    eprintln!("logit[248069] (</think>): {:.4}", logits.get(248069).unwrap_or(&f32::NAN));
+    eprintln!("logit[248045] (<|im_start|>): {:.4}", logits.get(248045).unwrap_or(&f32::NAN));
     let has_nan = logits.iter().any(|v| v.is_nan());
     let has_inf = logits.iter().any(|v| v.is_infinite());
     eprintln!("NaN: {has_nan}, Inf: {has_inf}, min: {:.4}, max: {:.4}",

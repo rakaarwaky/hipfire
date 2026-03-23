@@ -569,6 +569,13 @@ pub fn forward(
         }
     }
 
+    // Debug: dump hidden state before final norm
+    {
+        let hid = gpu.download_f32(&x)?;
+        let norm: f32 = hid.iter().map(|v| v * v).sum::<f32>().sqrt();
+        eprintln!("DEBUG final hidden: first8={:?} norm={:.4}", &hid[..8], norm);
+    }
+
     // Final norm + output projection
     gpu.rmsnorm_f32(&x, &weights.output_norm, &tmp, config.norm_eps)?;
     let logits = gpu.alloc_tensor(&[config.vocab_size], DType::F32)?;
