@@ -1,78 +1,26 @@
-# Hipfire: RDNA-Native ML Inference Engine
+# hipfire
 
-Rust-native LLM inference engine for AMD RDNA GPUs. No Python in the hot path, no ROCm link-time dependency — just `dlopen`, raw HIP kernels, and **59.3 tok/s on Qwen3-8B** (1.34x llama.cpp) on a $200 GPU.
+LLM inference engine for AMD RDNA GPUs. Written in Rust. Faster than llama.cpp at generation on every model tested.
 
-## The Finding: Q8 Beats Q4 on RDNA
+## What it does
 
-**On RDNA1, 8-bit quantization is 1.8x faster than 4-bit despite reading 2x more data.**
+Takes a quantized language model and runs it on your AMD GPU. Generates text at **59 tok/s for Qwen3-8B** and **256 tok/s for Qwen3-0.6B** on an RX 5700 XT ($200 GPU from 2019).
 
-Everyone assumes smaller quantization = faster inference because you're reading less data. That's true on NVIDIA where dp4a makes 4-bit dequantization essentially free. On AMD RDNA, the story is different:
-
-| Format | Bytes/weight | Bandwidth util | VGPRs | Waves/SIMD | TinyLlama tok/s |
-|--------|-------------|---------------|-------|------------|----------------|
-| F32 | 4.00 | 49% (218 GB/s) | 16 | ~10 | — |
-| **Q8_0** | **1.06** | **84% (375 GB/s)** | **16** | **~10** | **198** |
-| Q4_K | 0.56 | 42% (188 GB/s) | 40 | ~5 | 109 |
-
-Q4's nibble extraction (bit shifts, masks, conditional selects) inflates register pressure from 16 to 40 VGPRs, halving occupancy from ~10 to ~5 waves per SIMD. Fewer concurrent waves means less memory latency hiding, which cuts effective bandwidth nearly in half — erasing the advantage of reading less data.
-
-Q8 is just byte loads. No nibble extraction, no bit manipulation. The dequant path is `load byte -> convert -> FMA`. Register pressure matches F32 (16 VGPRs), occupancy matches F32 (~10 waves), and bandwidth utilization hits 84% of the 448 GB/s theoretical peak.
-
-**This means the optimal quantization for RDNA isn't the smallest — it's the one that keeps occupancy high.** Q8 at 1 byte/weight is the sweet spot: 4x compression over F32 with near-F32 memory efficiency.
-
-### Implications
-
-- **RDNA1 (RX 5700 XT):** Q8 is strictly faster than Q4 for any model that fits in VRAM
-- **RDNA2/3/4:** Likely similar, since the occupancy/register tradeoff is architectural. dp4a on RDNA2+ might close the gap but won't eliminate the register pressure from nibble unpacking
-- **Mixed quantization:** For VRAM-constrained models, Q8 for attention weights (latency-sensitive) + Q4 for FFN weights (bulk storage) could be optimal
-- **Nobody has published this.** The standard assumption in llama.cpp, vLLM, and every other inference engine is that Q4 < Q8 in speed because less data. On RDNA, the opposite is true.
+No Python runtime. No ROCm link-time dependency. Loads `libamdhip64.so` via `dlopen` at runtime — works across ROCm versions without recompilation.
 
 ## Performance
 
-All measurements on AMD RX 5700 XT (gfx1010, RDNA1, 8GB GDDR6, 448 GB/s peak).
-HFQ4-G256 weights + Q8_0 KV cache. llama.cpp build 7209 with custom ROCm build.
+Measured on AMD RX 5700 XT (gfx1010, RDNA1, 8GB GDDR6).
 
 | Benchmark | hipfire | llama.cpp | Ratio |
 |-----------|---------|-----------|-------|
-| **Qwen3-8B short gen** | **59.3 tok/s** | 44.3 tok/s | **1.34x** |
-| **Qwen3-8B long gen** | **52.7 tok/s** | 42.8 tok/s | **1.23x** |
-| Qwen3-8B prefill | 108 tok/s | 189.2 tok/s | 0.57x |
-| **Qwen3-0.6B short gen** | **256.3 tok/s** | 193.6 tok/s | **1.32x** |
-| Qwen3-0.6B prefill | 1053 tok/s | 1534 tok/s | 0.69x |
+| **Qwen3-8B generation** | **59.3 tok/s** | 44.3 tok/s | **1.34x** |
+| **Qwen3-8B long gen (1000+ tokens)** | **52.7 tok/s** | 42.8 tok/s | **1.23x** |
+| Qwen3-8B prompt processing | 108 tok/s | 189.2 tok/s | 0.57x |
+| **Qwen3-0.6B generation** | **256.3 tok/s** | 193.6 tok/s | **1.32x** |
+| Qwen3-0.6B prompt processing | 1053 tok/s | 1534 tok/s | 0.69x |
 
-hipfire wins all generation benchmarks. See [docs/PERF_COMPARISON.md](docs/PERF_COMPARISON.md) for details.
-
-## Architecture
-
-Three-crate Rust workspace, following [rustane](https://github.com/ncdrone/rustane)'s pattern:
-
-```
-hipfire/
-├── crates/
-│   ├── hip-bridge/          # Safe FFI to libamdhip64.so via dlopen
-│   ├── rdna-compute/        # HIP kernel compilation, dispatch, tensor ops
-│   ├── engine/              # GGUF/HFQ model loading, LLaMA/Qwen3 forward pass
-│   └── hipfire-quantize/    # Standalone quantizer: safetensors -> .hfq
-├── bench/                   # Profiling scripts and result compiler
-└── docs/
-    ├── PERF_COMPARISON.md   # Head-to-head vs llama.cpp with methodology
-    └── HFQ_FAMILY.md        # HFQ quantization format family specification
-```
-
-**Key design decisions:**
-- **dlopen, not link-time:** Loads `libamdhip64.so` at runtime. Works across ROCm versions without recompilation.
-- **Runtime kernel compilation:** HIP C++ kernels embedded as string constants, compiled via `hipcc --genco` on first use, `.hsaco` cached to disk.
-- **No HSA_OVERRIDE_GFX_VERSION:** Native gfx1010 support. No lying about hardware identity.
-- **Zero Python:** Pure Rust from tokenizer to token output.
-
-## Supported Models
-
-| Model | Format | VRAM | tok/s | vs llama.cpp |
-|-------|--------|------|-------|-------------|
-| **Qwen3-8B** | **HFQ4-G256** | **~4.4 GB** | **59.3** | **1.34x faster** |
-| **Qwen3-0.6B** | **HFQ4-G128** | **~0.4 GB** | **256.3** | **1.32x faster** |
-
-Architectures: LLaMA, Qwen3 (dense). Quantize from HuggingFace safetensors with `hipfire-quantize`.
+hipfire wins all generation benchmarks. llama.cpp wins prompt processing (prefill) due to rocBLAS GEMM. Full methodology and analysis in [docs/PERF_COMPARISON.md](docs/PERF_COMPARISON.md).
 
 ## Quick Start
 
@@ -81,92 +29,74 @@ Architectures: LLaMA, Qwen3 (dense). Quantize from HuggingFace safetensors with 
 cd hipfire
 cargo build --release
 
-# Quantize from HuggingFace safetensors to HFQ4
-# (auto-selects G128 for small models, G256 for 8B+)
+# Quantize a model from HuggingFace
+# Downloads safetensors + tokenizer, quantizes weights to 4-bit, embeds tokenizer
 cargo run --release -p hipfire-quantize -- \
-  --input ~/.cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/*/  \
+  --input ~/.cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/*/ \
   --output models/qwen3-8b.hfq \
   --format hfq4
 
 # Run inference
 cargo run --release --example infer_hfq -- models/qwen3-8b.hfq "Hello"
-
-# Run with GGUF model (also supported)
-cargo run --release --example infer -- /path/to/model.gguf "Hello"
 ```
 
 ### Requirements
 
-- AMD GPU with ROCm (tested on gfx1010/RDNA1, should work on RDNA2+)
+- AMD GPU with ROCm (tested on RDNA1 gfx1010, should work on RDNA2+)
 - `hipcc` in PATH (from ROCm installation)
 - Rust 1.75+
 
-## How It Works
+## How it works
 
-### GEMV Kernel (the hot loop)
+### Weight quantization: HFQ4
 
-For decode-phase inference, the bottleneck is matrix-vector multiplication (GEMV): one row of the weight matrix times the activation vector per output element. The kernel that does this determines throughput.
+Weights are stored in HFQ4 (HipFire Quantized 4-bit) format — a custom format designed for high GPU occupancy on RDNA.
 
-**Q8_0 GEMV v3** (the fast one):
-- 32 threads per block (single RDNA warp), warp shuffle reduction
-- Processes 8 consecutive Q8_0 blocks (256 elements) per loop iteration
-- `#pragma unroll` over the 8 blocks for instruction-level parallelism
-- Each iteration: load f16 scale, load i8 value, `scale * (float)qval * x[k]`
-- 16 VGPRs allocated -> max occupancy -> 84% peak bandwidth
+Each block of 256 weights: `[f32 scale][f32 zero][128 packed nibble bytes]` = 136 bytes. The GEMV kernel that multiplies these against activation vectors uses **18 VGPRs** — half what llama.cpp's Q4_K uses (39 VGPRs). Lower register usage means more concurrent wavefronts, which means better memory latency hiding, which means higher effective bandwidth.
 
-**Q4_K GEMV** (the slower one despite less data):
-- Same 32-thread warp structure
-- But: 6-bit packed scale decoding, nibble extraction via shifts/masks, type conversions
-- 40 VGPRs allocated -> half occupancy -> 42% peak bandwidth
+The quantizer (`hipfire-quantize`) reads HuggingFace safetensors directly. It auto-selects G256 (group size 256) for models with dim >= 4096 and G128 for smaller models. The tokenizer from `tokenizer.json` is embedded in the `.hfq` file — no external tokenizer dependency at inference time.
 
-### Standalone Quantizer
+### KV cache quantization: Q8_0
 
-`hipfire-quantize` reads FP16/BF16 safetensors directly from HuggingFace model directories and produces `.hfq` (HipFire Quantized) files. Quantization is done once, offline.
+During generation, the key-value cache is quantized to Q8_0 format (int8 values with f16 scale, 34 bytes per 32 elements). This reduces KV cache bandwidth by 3.76x compared to FP32, with negligible quality impact. The biggest effect is on long generation: **+39% tok/s** at 1000+ tokens where attention bandwidth dominates.
 
-Q8_FP16 symmetric quantization per group of 32:
+### Batched prefill
+
+Prompt tokens are processed in parallel:
+- **Batched GEMM**: all prompt tokens' projections computed with one weight load
+- **Batched RoPE**: all positions rotated in one kernel
+- **Batched causal attention**: all query positions attend to their causal context in one kernel
+- **Batched KV cache write**: all positions quantized and written in one launch
+
+### Runtime kernel compilation
+
+HIP kernels are embedded as C++ string constants in the Rust source. On first use, each kernel is compiled to `.hsaco` via `hipcc --genco` and cached to `/tmp/hipfire_kernels/`. A source hash ensures stale caches are recompiled. First inference run compiles ~15 kernels (takes a few seconds), subsequent runs use cache.
+
+## Architecture
+
 ```
-scale = max(|weights|) / 127
-quantized[i] = round(weight[i] / scale)  // int8, [-128, 127]
+hipfire/
+├── crates/
+│   ├── hip-bridge/          # Safe Rust FFI to libamdhip64.so via dlopen
+│   ├── rdna-compute/        # HIP kernel compilation, dispatch, GPU tensor ops
+│   ├── engine/              # Model loading (GGUF + HFQ), forward pass, tokenizer
+│   └── hipfire-quantize/    # Quantizer: HuggingFace safetensors -> .hfq
+├── bench/                   # Profiling scripts (run_profile.sh, compile_results.py)
+└── docs/
+    ├── PERF_COMPARISON.md   # Detailed benchmark comparison vs llama.cpp
+    └── HFQ_FAMILY.md        # HFQ quantization format family spec (Q2-Q8)
 ```
 
-Block format: `f16 scale (2B) + int8 values[32] (32B) = 34 bytes per 32 weights`.
+## Supported Models
 
-### .hfq File Format
+Any LLaMA-architecture or Qwen3 model from HuggingFace. Tested:
 
-Binary format with mmap-able tensor data:
-- Header: magic, version, architecture, tensor count, offsets
-- Metadata: JSON blob with model config + tokenizer reference
-- Tensor index: name, quant type, shape, data offset
-- Tensor data: 4096-byte aligned, directly mmap-able
+| Model | Weight format | VRAM | Generation tok/s |
+|-------|-------------|------|-----------------|
+| Qwen3-8B | HFQ4-G256 | ~4.4 GB | 59.3 |
+| Qwen3-0.6B | HFQ4-G128 | ~0.4 GB | 256.3 |
 
-## Research Log
-
-This project follows [Karpathy's autoresearch](https://github.com/karpathy/autoresearch) methodology: strategy document -> agent modifies code -> fixed eval -> keep/discard -> repeat.
-
-### Phase 0-2: Foundation
-- dlopen FFI to libamdhip64.so (no link-time ROCm dependency)
-- GGUF parser, BPE tokenizer, LLaMA forward pass
-- Basic GEMV kernel: 7.2 tok/s baseline
-
-### Phase 3: Kernel Optimization
-- Single-warp Q4_K GEMV with `__launch_bounds__(32, 20)`: 178.8 GB/s
-- GPU-side attention, RoPE, embedding lookup (eliminate CPU round-trips)
-- Fused silu_mul, in-place residual add
-- Result: 106.1 tok/s (14.7x from baseline)
-
-### Phase 4: The Q8 Discovery
-- Built Q4_F16 format, quantizer, .hfq file format (infrastructure)
-- Q4_F16 GEMV at parity with Q4_K (both ~42% peak) — format doesn't matter
-- Profiled with llvm-objdump: Q4_K uses 40 VGPRs, Q8_0 uses 16
-- Hypothesis: occupancy (waves/SIMD) explains the 42% vs 49% bandwidth gap
-- **Unrolled Q8_0 kernel hits 84% peak (375 GB/s)** — 2x Q4_K's bandwidth
-- End-to-end: 198 tok/s TinyLlama, 111 tok/s Qwen3 (27.5x total speedup)
-
-### Key Failed Experiments
-- **Q4_F16 format:** Simpler dequant doesn't help because GEMV is memory-bound, not compute-bound. The bottleneck is occupancy, not instruction count.
-- **256-thread wide quantized GEMV:** Element-strided access destroys metadata locality. Quantized blocks require block-sequential access for cache efficiency.
-- **Kernel fusion (fused QKV, gate+up):** Negligible gain (~0%) because HIP kernel launches are pipelined at 2.73us each. The GPU command queue overlaps them automatically.
-- **Multi-warp per row:** Shared memory reduction overhead > occupancy benefit for quantized GEMV.
+GGUF models also supported via the `infer` example (Q4_K_M, Q8_0).
 
 ## License
 
