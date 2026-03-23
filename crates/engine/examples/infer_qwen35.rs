@@ -46,13 +46,11 @@ fn main() {
 
     // DeltaNet state (check for --q8-state flag)
     let state_quant = if std::env::var("Q4_STATE").is_ok() {
-        eprintln!("Using Q4 S-state quantization");
         qwen35::StateQuant::Q4
-    } else if std::env::var("Q8_STATE").is_ok() {
-        eprintln!("Using Q8 S-state quantization");
-        qwen35::StateQuant::Q8
-    } else {
+    } else if std::env::var("FP32_STATE").is_ok() {
         qwen35::StateQuant::FP32
+    } else {
+        qwen35::StateQuant::Q8  // default: validated, 4x compression, no quality loss
     };
     let mut dn_state = qwen35::DeltaNetState::new_with_quant(&mut gpu, &config, state_quant).unwrap();
     eprintln!("DeltaNet state: {} S matrices ({:?}), {} conv states",

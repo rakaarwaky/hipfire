@@ -161,7 +161,7 @@ pub struct DeltaNetState {
 
 impl DeltaNetState {
     pub fn new(gpu: &mut Gpu, config: &Qwen35Config) -> HipResult<Self> {
-        Self::new_with_quant(gpu, config, StateQuant::FP32)
+        Self::new_with_quant(gpu, config, StateQuant::Q8)
     }
 
     pub fn new_with_quant(gpu: &mut Gpu, config: &Qwen35Config, quant: StateQuant) -> HipResult<Self> {
