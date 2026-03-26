@@ -279,7 +279,7 @@ fn main() {
 
     // Prompt tokens
     let mut prompt_tokens = tokenizer.encode("Hello");
-    if config.arch == llama::ModelArch::Qwen3 {
+    if std::env::var("CHATML").is_ok() && config.arch == llama::ModelArch::Qwen3 {
         let im_start = tokenizer.encode("<|im_start|>");
         let im_end = tokenizer.encode("<|im_end|>");
         let user_tok = tokenizer.encode("user");

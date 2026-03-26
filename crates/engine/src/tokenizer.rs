@@ -73,8 +73,7 @@ impl Tokenizer {
         let mut special_tokens: Vec<(String, u32)> = Vec::new();
         for (i, tok) in vocab.iter().enumerate() {
             if (tok.starts_with("<|") && tok.ends_with("|>"))
-                || (tok.starts_with("</") && tok.ends_with(">") && tok.len() > 3)
-                || (tok.starts_with("<") && tok.ends_with(">") && tok.contains("0x"))
+                || (tok.starts_with("<") && tok.ends_with(">") && tok.len() > 3 && !tok.contains(' '))
             {
                 special_tokens.push((tok.clone(), i as u32));
             }
@@ -149,7 +148,9 @@ impl Tokenizer {
                     }
                     vocab[id as usize] = content.to_string();
                     token_to_id.insert(content.to_string(), id);
-                    if at.get("special").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    let is_special = at.get("special").and_then(|v| v.as_bool()).unwrap_or(false)
+                        || (content.starts_with("<") && content.ends_with(">") && content.len() > 3 && !content.contains(' '));
+                    if is_special {
                         special_tokens.push((content.to_string(), id));
                     }
                 }

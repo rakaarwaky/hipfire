@@ -13,8 +13,20 @@ fn main() {
     use std::time::Instant;
 
     let args: Vec<String> = std::env::args().collect();
-    let model_path = args.get(1).expect("Usage: infer_qwen35 <model.hfq> [prompt]");
-    let prompt_text = if args.len() > 2 { args[2..].join(" ") } else { "Hello".to_string() };
+    let model_path = args.get(1).expect("Usage: infer_qwen35 <model.hfq> [--temp T] [--top-p P] [prompt]");
+    let mut temperature = 0.6f32;
+    let mut top_p = 0.9f32;
+    let mut prompt_parts = Vec::new();
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--temp" => { temperature = args.get(i+1).and_then(|s| s.parse().ok()).unwrap_or(0.6); i += 2; }
+            "--top-p" => { top_p = args.get(i+1).and_then(|s| s.parse().ok()).unwrap_or(0.9); i += 2; }
+            _ => { prompt_parts.push(args[i].clone()); i += 1; }
+        }
+    }
+    let prompt_text = if prompt_parts.is_empty() { "Hello".to_string() } else { prompt_parts.join(" ") };
+    eprintln!("Sampling: temp={temperature}, top_p={top_p}");
 
     let hfq = HfqFile::open(Path::new(model_path)).expect("failed to open HFQ");
     let config = qwen35::config_from_hfq(&hfq).expect("failed to parse config");
@@ -36,10 +48,9 @@ fn main() {
     let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("failed to load weights");
     eprintln!("  Loaded in {:.1}s", t0.elapsed().as_secs_f64());
 
-    // KV cache for full attention layers only (6 layers for 0.8B)
-    let n_full_attn = config.layer_types.iter().filter(|t| **t == qwen35::LayerType::FullAttention).count();
-    // KV cache needs to be indexed by layer_idx, so allocate for ALL layers but only full attn ones use it
-    let kv_seq_len = 2048usize.min(262144); // cap at 2048 for now
+    // KV cache: env KV_SEQ_LEN overrides, default 2048
+    let kv_seq_len: usize = std::env::var("KV_SEQ_LEN")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(2048);
     let mut kv_cache = engine::llama::KvCache::new_gpu(
         &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len,
     ).unwrap();
@@ -58,24 +69,24 @@ fn main() {
 
     // Tokenize with ChatML (skip if NO_CHATML env var set)
     let mut prompt_tokens = tokenizer.encode(&prompt_text);
-    let has_chatml = tokenizer.encode("<|im_start|>").len() == 1 && std::env::var("NO_CHATML").is_err();
-    if has_chatml {
-        let im_start = tokenizer.encode("<|im_start|>");
-        let im_end = tokenizer.encode("<|im_end|>");
-        let nl = tokenizer.encode("\n");
-        let sys = tokenizer.encode("system");
-        let sys_msg = tokenizer.encode("You are a helpful assistant.");
-        let user = tokenizer.encode("user");
-        let asst = tokenizer.encode("assistant");
-        let mut chat = Vec::new();
-        chat.extend_from_slice(&im_start); chat.extend_from_slice(&sys); chat.extend_from_slice(&nl);
-        chat.extend_from_slice(&sys_msg); chat.extend_from_slice(&im_end); chat.extend_from_slice(&nl);
-        chat.extend_from_slice(&im_start); chat.extend_from_slice(&user); chat.extend_from_slice(&nl);
-        chat.extend_from_slice(&prompt_tokens); chat.extend_from_slice(&im_end); chat.extend_from_slice(&nl);
-        chat.extend_from_slice(&im_start); chat.extend_from_slice(&asst); chat.extend_from_slice(&nl);
-        prompt_tokens = chat;
+    let use_chatml = std::env::var("CHATML").is_ok();
+    if use_chatml {
+        // ChatML mode — for instruct-tuned models only (no forced <think>)
+        let template = format!(
+            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n\
+             <|im_start|>user\n{}<|im_end|>\n\
+             <|im_start|>assistant\n",
+            prompt_text
+        );
+        prompt_tokens = tokenizer.encode(&template);
     }
     eprintln!("Prompt: \"{}\" → {} tokens: {:?}", prompt_text, prompt_tokens.len(), &prompt_tokens[..prompt_tokens.len().min(10)]);
+
+    if prompt_tokens.len() > kv_seq_len {
+        eprintln!("ERROR: prompt ({} tokens) exceeds KV cache capacity ({kv_seq_len}). Set KV_SEQ_LEN=N to increase.",
+            prompt_tokens.len());
+        std::process::exit(1);
+    }
 
     // Process prompt
     let t1 = Instant::now();
@@ -111,10 +122,15 @@ fn main() {
         logits.iter().cloned().fold(f32::INFINITY, f32::min),
         logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
 
-    // Generate
-    let max_gen = 128;
+    // Generate — cap to stay within KV cache
+    let max_gen = 128.min(kv_seq_len.saturating_sub(prompt_tokens.len() + 1));
+    if max_gen == 0 {
+        eprintln!("ERROR: prompt ({} tokens) exceeds KV cache capacity ({kv_seq_len}). Set KV_SEQ_LEN=N to increase.",
+            prompt_tokens.len());
+        std::process::exit(1);
+    }
     let t2 = Instant::now();
-    let mut next_token = engine::llama::argmax(&logits);
+    let mut next_token = engine::llama::sample_top_p(&logits, temperature, top_p);
     let mut generated = Vec::new();
 
     for gi in 0..max_gen {
@@ -124,12 +140,17 @@ fn main() {
         std::io::stdout().flush().ok();
         if gi < 5 { eprintln!("[gen {gi}: id={next_token} text={text:?}]"); }
 
+        // Stop on EOS or turn-end tokens
         if next_token == config.eos_token { break; }
+        if use_chatml {
+            let im_end_id = tokenizer.encode("<|im_end|>");
+            if im_end_id.len() == 1 && next_token == im_end_id[0] { break; }
+        }
 
         let pos = prompt_tokens.len() + generated.len() - 1;
         logits = qwen35::forward(&mut gpu, &weights, &config, next_token, pos, &mut kv_cache, &mut dn_state)
             .expect("forward failed");
-        next_token = engine::llama::argmax(&logits);
+        next_token = engine::llama::sample_top_p(&logits, temperature, top_p);
     }
 
     let gen_ms = t2.elapsed().as_millis();

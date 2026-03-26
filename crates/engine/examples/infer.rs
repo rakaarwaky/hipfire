@@ -47,8 +47,8 @@ fn main() {
     // Tokenize prompt
     let mut prompt_tokens = tokenizer.encode(&prompt_text);
 
-    // For Qwen3: wrap in chat template if architecture is qwen3
-    if config.arch == llama::ModelArch::Qwen3 {
+    // ChatML: opt-in only (CHATML=1). Base models break with auto-ChatML.
+    if std::env::var("CHATML").is_ok() && config.arch == llama::ModelArch::Qwen3 {
         // <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n
         let im_start = tokenizer.encode("<|im_start|>");
         let im_end = tokenizer.encode("<|im_end|>");

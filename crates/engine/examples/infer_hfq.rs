@@ -62,10 +62,11 @@ fn main() {
 
     let mut prompt_tokens = tokenizer.encode(&prompt_text);
 
-    // ChatML template: auto-detect from tokenizer (works for Qwen3, Qwen3.5, etc.)
-    let has_chatml = tokenizer.encode("<|im_start|>").len() == 1
+    // ChatML: opt-in only (CHATML=1). Base models break with auto-ChatML.
+    let use_chatml = std::env::var("CHATML").is_ok()
+        && tokenizer.encode("<|im_start|>").len() == 1
         && tokenizer.encode("<|im_end|>").len() == 1;
-    if has_chatml {
+    if use_chatml {
         let im_start = tokenizer.encode("<|im_start|>");
         let im_end = tokenizer.encode("<|im_end|>");
         let user_tok = tokenizer.encode("user");

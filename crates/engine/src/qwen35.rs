@@ -425,6 +425,7 @@ pub fn forward(
 
     let mut delta_layer_idx = 0usize;
     let debug_layers = std::env::var("DEBUG_LAYERS").is_ok();
+    let dump_norms = std::env::var("DUMP_NORMS").is_ok();
 
     if debug_layers && pos == 0 {
         let hid = gpu.download_f32(&x)?;
@@ -560,6 +561,12 @@ pub fn forward(
                 weight_gemv(gpu, &layer.w_down, &ffn_hidden, &ffn_out)?;
                 gpu.add_inplace_f32(&x, &ffn_out)?;
 
+                if dump_norms {
+                    let hid = gpu.download_f32(&x)?;
+                    let norm: f32 = hid.iter().map(|v| v*v).sum::<f32>().sqrt();
+                    eprintln!("[pos={pos}] L{layer_idx:02} DN  x_norm={norm:.4}");
+                }
+
                 // Free temporaries
                 for t in [qkv, z, beta_out, alpha_out, conv_out, q_part, k_part, v_part, q_gdn, k_gdn, attn_out, normed_out, o, gate, up, ffn_hidden, ffn_out] {
                     gpu.free_tensor(t)?;
@@ -641,6 +648,12 @@ pub fn forward(
                 weight_gemv(gpu, &layer.w_down, &ffn_hidden, &ffn_out)?;
                 gpu.add_inplace_f32(&x, &ffn_out)?;
 
+                if dump_norms {
+                    let hid = gpu.download_f32(&x)?;
+                    let norm: f32 = hid.iter().map(|v| v*v).sum::<f32>().sqrt();
+                    eprintln!("[pos={pos}] L{layer_idx:02} FA  x_norm={norm:.4}");
+                }
+
                 for t in [q_full, q, gate_vec, k, v, attn_out, o, gate_ffn, up, ffn_hidden, ffn_out] {
                     gpu.free_tensor(t)?;
                 }
@@ -670,4 +683,517 @@ pub fn forward(
     gpu.hip.free(pos_buf)?;
 
     Ok(logits_data)
+}
+
+/// Batched prefill: process all prompt tokens at once.
+/// DeltaNet layers still sequential per token (recurrent state), but full attention
+/// layers and FFN use batched GEMM + batched causal attention.
+/// Returns logits for the LAST position only.
+pub fn prefill_forward(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+) -> HipResult<Vec<f32>> {
+    let batch = tokens.len();
+    if batch <= 1 {
+        // Single token: use regular forward
+        return forward(gpu, weights, config, tokens[0], 0, kv_cache, dn_state);
+    }
+    let dim = config.dim;
+
+    // Allocate batched hidden state: [batch × dim]
+    let x_batch = gpu.alloc_tensor(&[batch, dim], DType::F32)?;
+
+    // Embedding: lookup each token
+    let x_single = gpu.alloc_tensor(&[dim], DType::F32)?;
+    for (i, &token) in tokens.iter().enumerate() {
+        match weights.embd_format {
+            EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(&weights.token_embd, &x_single, token, dim)?,
+            EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.token_embd, &x_single, token, dim)?,
+            EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &x_single, token, dim)?,
+            EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &x_single, token, dim)?,
+            _ => panic!("unsupported embedding format"),
+        }
+        gpu.hip.memcpy_dtod_at(&x_batch.buf, i * dim * 4, &x_single.buf, 0, dim * 4)?;
+    }
+    gpu.free_tensor(x_single)?;
+
+    let tmp_batch = gpu.alloc_tensor(&[batch, dim], DType::F32)?;
+
+    // Scratch for per-token ops
+    let x_tok = gpu.alloc_tensor(&[dim], DType::F32)?;
+    let tmp_tok = gpu.alloc_tensor(&[dim], DType::F32)?;
+    let pos_buf = gpu.hip.malloc(4)?;
+
+    let mut delta_layer_idx = 0usize;
+
+    for layer_idx in 0..config.n_layers {
+        match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
+            (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
+                // DeltaNet: process each token sequentially (state depends on previous)
+                for t in 0..batch {
+                    // Extract token t from batch
+                    gpu.hip.memcpy_dtod_at(&x_tok.buf, 0, &x_batch.buf, t * dim * 4, dim * 4)?;
+
+                    gpu.rmsnorm_f32(&x_tok, &layer.attn_norm, &tmp_tok, config.norm_eps)?;
+
+                    let qkv_dim = config.linear_num_key_heads * config.linear_key_head_dim * 2
+                                 + config.linear_num_value_heads * config.linear_value_head_dim;
+                    let d_inner = config.linear_num_value_heads * config.linear_value_head_dim;
+                    let n_v_heads = config.linear_num_value_heads;
+                    let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+                    let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
+
+                    let qkv = gpu.alloc_tensor(&[qkv_dim], DType::F32)?;
+                    weight_gemv(gpu, &layer.wqkv, &tmp_tok, &qkv)?;
+                    let z = gpu.alloc_tensor(&[d_inner], DType::F32)?;
+                    weight_gemv(gpu, &layer.wz, &tmp_tok, &z)?;
+                    let beta_out = gpu.alloc_tensor(&[n_v_heads], DType::F32)?;
+                    weight_gemv(gpu, &layer.w_beta, &tmp_tok, &beta_out)?;
+                    gpu.sigmoid_f32(&beta_out)?;
+                    let alpha_out = gpu.alloc_tensor(&[n_v_heads], DType::F32)?;
+                    weight_gemv(gpu, &layer.w_alpha, &tmp_tok, &alpha_out)?;
+                    gpu.alpha_gate_f32(&alpha_out, &layer.dt_bias, &layer.a_log, n_v_heads)?;
+
+                    let conv_out = gpu.alloc_tensor(&[qkv_dim], DType::F32)?;
+                    gpu.conv1d_silu_f32(&conv_out, &qkv, &layer.conv_weight,
+                        &dn_state.conv_states[delta_layer_idx], qkv_dim)?;
+
+                    let q_part = gpu.alloc_tensor(&[k_dim], DType::F32)?;
+                    let k_part = gpu.alloc_tensor(&[k_dim], DType::F32)?;
+                    let v_part = gpu.alloc_tensor(&[v_dim], DType::F32)?;
+                    gpu.hip.memcpy_dtod_at(&q_part.buf, 0, &conv_out.buf, 0, k_dim * 4)?;
+                    gpu.hip.memcpy_dtod_at(&k_part.buf, 0, &conv_out.buf, k_dim * 4, k_dim * 4)?;
+                    gpu.hip.memcpy_dtod_at(&v_part.buf, 0, &conv_out.buf, k_dim * 2 * 4, v_dim * 4)?;
+
+                    gpu.l2_norm_f32(&q_part, config.linear_num_key_heads, config.linear_key_head_dim, config.norm_eps)?;
+                    gpu.l2_norm_f32(&k_part, config.linear_num_key_heads, config.linear_key_head_dim, config.norm_eps)?;
+                    gpu.scale_f32(&q_part, 1.0 / (config.linear_key_head_dim as f32).sqrt())?;
+
+                    // Repeat Q/K heads if needed
+                    let (q_gdn, k_gdn) = if config.linear_num_key_heads < n_v_heads {
+                        let ratio = n_v_heads / config.linear_num_key_heads;
+                        let expanded_dim = n_v_heads * config.linear_key_head_dim;
+                        let q_exp = gpu.alloc_tensor(&[expanded_dim], DType::F32)?;
+                        let k_exp = gpu.alloc_tensor(&[expanded_dim], DType::F32)?;
+                        let hd = config.linear_key_head_dim;
+                        for kh in 0..config.linear_num_key_heads {
+                            for r in 0..ratio {
+                                let dst = (kh * ratio + r) * hd * 4;
+                                let src = kh * hd * 4;
+                                gpu.hip.memcpy_dtod_at(&q_exp.buf, dst, &q_part.buf, src, hd * 4)?;
+                                gpu.hip.memcpy_dtod_at(&k_exp.buf, dst, &k_part.buf, src, hd * 4)?;
+                            }
+                        }
+                        (q_exp, k_exp)
+                    } else {
+                        let q_ref = gpu.alloc_tensor(&[k_dim], DType::F32)?;
+                        let k_ref = gpu.alloc_tensor(&[k_dim], DType::F32)?;
+                        gpu.hip.memcpy_dtod_at(&q_ref.buf, 0, &q_part.buf, 0, k_dim * 4)?;
+                        gpu.hip.memcpy_dtod_at(&k_ref.buf, 0, &k_part.buf, 0, k_dim * 4)?;
+                        (q_ref, k_ref)
+                    };
+
+                    let attn_out = gpu.alloc_tensor(&[v_dim], DType::F32)?;
+                    match dn_state.quant {
+                        StateQuant::FP32 => gpu.gated_delta_net_f32(
+                            &q_gdn, &k_gdn, &v_part, &alpha_out, &beta_out,
+                            &dn_state.s_matrices[delta_layer_idx], &attn_out,
+                            1, n_v_heads, config.linear_value_head_dim)?,
+                        StateQuant::Q8 => gpu.gated_delta_net_q8(
+                            &q_gdn, &k_gdn, &v_part, &alpha_out, &beta_out,
+                            &dn_state.s_matrices[delta_layer_idx],
+                            &dn_state.s_scales[delta_layer_idx], &attn_out,
+                            1, n_v_heads, config.linear_value_head_dim)?,
+                        StateQuant::Q4 => gpu.gated_delta_net_q4(
+                            &q_gdn, &k_gdn, &v_part, &alpha_out, &beta_out,
+                            &dn_state.s_matrices[delta_layer_idx],
+                            &dn_state.s_scales[delta_layer_idx], &attn_out,
+                            1, n_v_heads, config.linear_value_head_dim)?,
+                    }
+
+                    let normed_out = gpu.alloc_tensor(&[v_dim], DType::F32)?;
+                    gpu.gated_norm_f32(&attn_out, &z, &layer.norm_weight, &normed_out,
+                        n_v_heads, config.linear_value_head_dim, config.norm_eps)?;
+
+                    let o = gpu.alloc_tensor(&[dim], DType::F32)?;
+                    weight_gemv(gpu, &layer.wo, &normed_out, &o)?;
+                    gpu.add_inplace_f32(&x_tok, &o)?;
+
+                    // FFN
+                    gpu.rmsnorm_f32(&x_tok, &layer.ffn_norm, &tmp_tok, config.norm_eps)?;
+                    let gate = gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?;
+                    let up = gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?;
+                    weight_gemv(gpu, &layer.w_gate, &tmp_tok, &gate)?;
+                    weight_gemv(gpu, &layer.w_up, &tmp_tok, &up)?;
+                    let ffn_hidden = gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?;
+                    gpu.silu_mul_f32(&gate, &up, &ffn_hidden)?;
+                    let ffn_out = gpu.alloc_tensor(&[dim], DType::F32)?;
+                    weight_gemv(gpu, &layer.w_down, &ffn_hidden, &ffn_out)?;
+                    gpu.add_inplace_f32(&x_tok, &ffn_out)?;
+
+                    // Write back to batch
+                    gpu.hip.memcpy_dtod_at(&x_batch.buf, t * dim * 4, &x_tok.buf, 0, dim * 4)?;
+
+                    for tensor in [qkv, z, beta_out, alpha_out, conv_out, q_part, k_part, v_part, q_gdn, k_gdn, attn_out, normed_out, o, gate, up, ffn_hidden, ffn_out] {
+                        gpu.free_tensor(tensor)?;
+                    }
+                }
+                delta_layer_idx += 1;
+            }
+
+            (LayerWeights::FullAttn(layer), LayerType::FullAttention) => {
+                // Full attention: batched processing for all tokens at once
+                gpu.rmsnorm_batched(&x_batch, &layer.attn_norm, &tmp_batch, batch, dim, config.norm_eps)?;
+
+                // Batched Q projection (2x wide)
+                let q_full_dim = config.n_heads * config.head_dim * 2;
+                let q_full_batch = gpu.alloc_tensor(&[batch, q_full_dim], DType::F32)?;
+                llama::weight_gemm(gpu, &layer.wq, &tmp_batch, &q_full_batch, batch)?;
+
+                // Split Q/gate for each token and head
+                let q_dim = config.n_heads * config.head_dim;
+                let q_batch_buf = gpu.alloc_tensor(&[batch, q_dim], DType::F32)?;
+                let gate_batch_buf = gpu.alloc_tensor(&[batch, q_dim], DType::F32)?;
+                for t in 0..batch {
+                    for h in 0..config.n_heads {
+                        let src_q_off = t * q_full_dim * 4 + h * config.head_dim * 2 * 4;
+                        let src_g_off = t * q_full_dim * 4 + (h * config.head_dim * 2 + config.head_dim) * 4;
+                        let dst_off = t * q_dim * 4 + h * config.head_dim * 4;
+                        gpu.hip.memcpy_dtod_at(&q_batch_buf.buf, dst_off, &q_full_batch.buf, src_q_off, config.head_dim * 4)?;
+                        gpu.hip.memcpy_dtod_at(&gate_batch_buf.buf, dst_off, &q_full_batch.buf, src_g_off, config.head_dim * 4)?;
+                    }
+                }
+                gpu.free_tensor(q_full_batch)?;
+
+                // Batched Q norm (batch * n_heads instances)
+                gpu.rmsnorm_batched(&q_batch_buf, &layer.q_norm, &q_batch_buf,
+                    batch * config.n_heads, config.head_dim, config.norm_eps)?;
+
+                // Batched K, V projections
+                let kv_dim = config.n_kv_heads * config.head_dim;
+                let k_batch_buf = gpu.alloc_tensor(&[batch, kv_dim], DType::F32)?;
+                let v_batch_buf = gpu.alloc_tensor(&[batch, kv_dim], DType::F32)?;
+                llama::weight_gemm(gpu, &layer.wk, &tmp_batch, &k_batch_buf, batch)?;
+                llama::weight_gemm(gpu, &layer.wv, &tmp_batch, &v_batch_buf, batch)?;
+
+                // Batched K norm
+                gpu.rmsnorm_batched(&k_batch_buf, &layer.k_norm, &k_batch_buf,
+                    batch * config.n_kv_heads, config.head_dim, config.norm_eps)?;
+
+                // Per-token RoPE + KV cache write (partial interleaved RoPE not batched yet)
+                let q_tok = gpu.alloc_tensor(&[q_dim], DType::F32)?;
+                let k_tok = gpu.alloc_tensor(&[kv_dim], DType::F32)?;
+                let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
+                for t in 0..batch {
+                    gpu.hip.memcpy_dtod_at(&q_tok.buf, 0, &q_batch_buf.buf, t * q_dim * 4, q_dim * 4)?;
+                    gpu.hip.memcpy_dtod_at(&k_tok.buf, 0, &k_batch_buf.buf, t * kv_dim * 4, kv_dim * 4)?;
+                    gpu.rope_partial_interleaved_f32(&q_tok, &k_tok, t as i32,
+                        config.n_heads, config.n_kv_heads, config.head_dim, n_rot, config.rope_theta)?;
+                    gpu.hip.memcpy_dtod_at(&q_batch_buf.buf, t * q_dim * 4, &q_tok.buf, 0, q_dim * 4)?;
+                    gpu.hip.memcpy_dtod_at(&k_batch_buf.buf, t * kv_dim * 4, &k_tok.buf, 0, kv_dim * 4)?;
+
+                    let pos_i32 = t as i32;
+                    gpu.hip.memcpy_htod(&pos_buf, &pos_i32.to_ne_bytes())?;
+                    gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &k_tok, &pos_buf, kv_dim)?;
+                    let v_tok_tmp = gpu.alloc_tensor(&[kv_dim], DType::F32)?;
+                    gpu.hip.memcpy_dtod_at(&v_tok_tmp.buf, 0, &v_batch_buf.buf, t * kv_dim * 4, kv_dim * 4)?;
+                    gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &v_tok_tmp, &pos_buf, kv_dim)?;
+                    gpu.free_tensor(v_tok_tmp)?;
+                }
+                gpu.free_tensor(q_tok)?;
+                gpu.free_tensor(k_tok)?;
+
+                // Batched causal attention
+                let attn_out_batch = gpu.alloc_tensor(&[batch, q_dim], DType::F32)?;
+                gpu.attention_causal_batched(
+                    &q_batch_buf, &k_batch_buf, &v_batch_buf, &attn_out_batch,
+                    batch, config.n_heads, config.n_kv_heads, config.head_dim)?;
+
+                // Batched sigmoid gate
+                gpu.sigmoid_f32(&gate_batch_buf)?;
+                gpu.mul_f32(&attn_out_batch, &gate_batch_buf, &attn_out_batch)?;
+
+                // Batched output projection
+                let o_batch = gpu.alloc_tensor(&[batch, dim], DType::F32)?;
+                llama::weight_gemm(gpu, &layer.wo, &attn_out_batch, &o_batch, batch)?;
+                gpu.add_inplace_f32(&x_batch, &o_batch)?;
+
+                // Batched FFN
+                gpu.rmsnorm_batched(&x_batch, &layer.ffn_norm, &tmp_batch, batch, dim, config.norm_eps)?;
+                let gate_ffn_batch = gpu.alloc_tensor(&[batch, config.hidden_dim], DType::F32)?;
+                let up_batch = gpu.alloc_tensor(&[batch, config.hidden_dim], DType::F32)?;
+                llama::weight_gemm(gpu, &layer.w_gate, &tmp_batch, &gate_ffn_batch, batch)?;
+                llama::weight_gemm(gpu, &layer.w_up, &tmp_batch, &up_batch, batch)?;
+                let ffn_hidden_batch = gpu.alloc_tensor(&[batch, config.hidden_dim], DType::F32)?;
+                gpu.silu_mul_f32(&gate_ffn_batch, &up_batch, &ffn_hidden_batch)?;
+                let ffn_out_batch = gpu.alloc_tensor(&[batch, dim], DType::F32)?;
+                llama::weight_gemm(gpu, &layer.w_down, &ffn_hidden_batch, &ffn_out_batch, batch)?;
+                gpu.add_inplace_f32(&x_batch, &ffn_out_batch)?;
+
+                for t in [q_batch_buf, gate_batch_buf, k_batch_buf, v_batch_buf, attn_out_batch, o_batch, gate_ffn_batch, up_batch, ffn_hidden_batch, ffn_out_batch] {
+                    gpu.free_tensor(t)?;
+                }
+            }
+
+            _ => panic!("layer type mismatch"),
+        }
+    }
+
+    // Final norm + output for last position only
+    let last_off = (batch - 1) * dim * 4;
+    let x_last = gpu.alloc_tensor(&[dim], DType::F32)?;
+    gpu.hip.memcpy_dtod_at(&x_last.buf, 0, &x_batch.buf, last_off, dim * 4)?;
+    let tmp_last = gpu.alloc_tensor(&[dim], DType::F32)?;
+    gpu.rmsnorm_f32(&x_last, &weights.output_norm, &tmp_last, config.norm_eps)?;
+    let logits = gpu.alloc_tensor(&[config.vocab_size], DType::F32)?;
+    weight_gemv(gpu, &weights.output, &tmp_last, &logits)?;
+    let logits_data = gpu.download_f32(&logits)?;
+
+    gpu.free_tensor(x_batch)?;
+    gpu.free_tensor(tmp_batch)?;
+    gpu.free_tensor(x_tok)?;
+    gpu.free_tensor(tmp_tok)?;
+    gpu.free_tensor(x_last)?;
+    gpu.free_tensor(tmp_last)?;
+    gpu.free_tensor(logits)?;
+    gpu.hip.free(pos_buf)?;
+
+    Ok(logits_data)
+}
+
+// ─── Chunked DeltaNet (CPU reference) ────────────────────────────────────
+
+/// CPU: sequential DeltaNet recurrence for one head.
+/// S [hd×hd] row-major. Q/K/V [n_tokens×hd]. alpha/beta [n_tokens].
+/// alpha = raw gate (negative); exp(alpha) = decay.
+pub fn deltanet_sequential_cpu(
+    q: &[f32], k: &[f32], v: &[f32],
+    alpha: &[f32], beta: &[f32],
+    s_in: &[f32], n_tokens: usize, hd: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut s = s_in.to_vec();
+    let mut output = vec![0.0f32; n_tokens * hd];
+    for t in 0..n_tokens {
+        let qt = &q[t*hd..(t+1)*hd];
+        let kt = &k[t*hd..(t+1)*hd];
+        let vt = &v[t*hd..(t+1)*hd];
+        let a = alpha[t].exp();
+        let b = beta[t];
+        // kv = S^T @ k
+        let mut kv = vec![0.0f32; hd];
+        for r in 0..hd { for c in 0..hd { kv[r] += s[c*hd+r] * kt[c]; } }
+        // delta = (v - a*kv) * beta
+        let mut delta = vec![0.0f32; hd];
+        for i in 0..hd { delta[i] = (vt[i] - a * kv[i]) * b; }
+        // S = a*S + k ⊗ delta
+        for r in 0..hd { for c in 0..hd { s[r*hd+c] = a * s[r*hd+c] + kt[c] * delta[r]; } }
+        // output = S @ q
+        for r in 0..hd {
+            let mut sum = 0.0f32;
+            for c in 0..hd { sum += s[r*hd+c] * qt[c]; }
+            output[t*hd+r] = sum;
+        }
+    }
+    (output, s)
+}
+
+/// CPU: chunked DeltaNet for one head. Computes output via intra-chunk attention
+/// matrix (parallel) + cross-chunk state. Mathematically identical to sequential.
+pub fn deltanet_chunked_cpu(
+    q: &[f32], k: &[f32], v: &[f32],
+    alpha: &[f32], beta: &[f32],
+    s_in: &[f32], n_tokens: usize, hd: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let c = n_tokens;
+    // Decay mask D[i][j] = product(exp(alpha[k]) for k=j+1..=i), causal
+    let mut d = vec![0.0f32; c * c];
+    for i in 0..c {
+        d[i*c+i] = 1.0;
+        for j in (0..i).rev() { d[i*c+j] = d[i*c+(j+1)] * alpha[j+1].exp(); }
+    }
+    // Exactly follow HF's torch_chunk_gated_delta_rule algorithm:
+    // 1. v_beta = V * beta, k_beta = K * beta
+    let mut v_beta = vec![0.0f32; c * hd];
+    let mut k_beta = vec![0.0f32; c * hd];
+    for t in 0..c { for dd in 0..hd {
+        v_beta[t*hd+dd] = v[t*hd+dd] * beta[t];
+        k_beta[t*hd+dd] = k[t*hd+dd] * beta[t];
+    }}
+
+    // 2. g = cumsum(alpha) — HF does g = g.cumsum(dim=-1) BEFORE decay_mask
+    let mut g_cum = vec![0.0f32; c];
+    g_cum[0] = alpha[0];
+    for i in 1..c { g_cum[i] = g_cum[i-1] + alpha[i]; }
+
+    // 3. decay_mask[i][j] = exp(g[i] - g[j]) if j <= i, 0 otherwise (lower triangular)
+    //    Note: HF does .tril() after exp, and the formula is (g[i] - g[j]).tril().exp().tril()
+    let mut decay = vec![0.0f32; c * c];
+    for i in 0..c { for j in 0..=i {
+        decay[i*c+j] = (g_cum[i] - g_cum[j]).exp();
+    }}
+
+    // 4. attn = -((k_beta @ key^T) * decay_mask), zero on upper triangle AND diagonal
+    let mut attn = vec![0.0f32; c * c];
+    for i in 0..c { for j in 0..i { // j < i strictly (zero diagonal)
+        let mut dot = 0.0f32;
+        for dd in 0..hd { dot += k_beta[i*hd+dd] * k[j*hd+dd]; }
+        attn[i*c+j] = -dot * decay[i*c+j];
+    }}
+
+    // 5. Forward substitution (resolve recursive S dependency)
+    for i in 1..c {
+        let row: Vec<f32> = (0..i).map(|j| attn[i*c+j]).collect();
+        for j in 0..i {
+            // correction = sum_m row[m] * attn[m][j] for m in 0..i
+            let mut corr = 0.0f32;
+            for m in 0..i { corr += row[m] * attn[m*c+j]; }
+            attn[i*c+j] = row[j] + corr;
+        }
+    }
+
+    // 6. attn += I
+    for i in 0..c { attn[i*c+i] = 1.0; }
+
+    // 7. value_corrected = attn @ v_beta
+    let mut v_corr = vec![0.0f32; c * hd];
+    for i in 0..c { for j in 0..=i {
+        let aij = attn[i*c+j];
+        for dd in 0..hd { v_corr[i*hd+dd] += aij * v_beta[j*hd+dd]; }
+    }}
+
+    // 8. k_cumdecay = attn @ (k_beta * exp(g))
+    let mut kb_g = vec![0.0f32; c * hd];
+    for t in 0..c { for dd in 0..hd { kb_g[t*hd+dd] = k_beta[t*hd+dd] * g_cum[t].exp(); } }
+    let mut k_cumdecay = vec![0.0f32; c * hd];
+    for i in 0..c { for j in 0..=i {
+        let aij = attn[i*c+j];
+        for dd in 0..hd { k_cumdecay[i*hd+dd] += aij * kb_g[j*hd+dd]; }
+    }}
+
+    // 9. Per-chunk processing (single chunk = entire prompt)
+    let mut s_state = s_in.to_vec();
+    let mut output = vec![0.0f32; c * hd];
+
+    // QK attention: (Q @ K^T) * decay_mask, causal (upper triangle masked)
+    // Note: HF masks upper triangle with 1 (not 0) using mask = triu(ones, diagonal=1)
+    // and then masked_fill_(mask, 0) — so upper strictly above diagonal is 0
+    let mut qk_decay = vec![0.0f32; c * c];
+    for i in 0..c { for j in 0..=i {
+        let mut dot = 0.0f32;
+        for dd in 0..hd { dot += q[i*hd+dd] * k[j*hd+dd]; }
+        qk_decay[i*c+j] = dot * decay[i*c+j];
+    }}
+
+    // v_prime = k_cumdecay @ S_state
+    let mut v_prime = vec![0.0f32; c * hd];
+    for t in 0..c { for r in 0..hd {
+        let mut sum = 0.0f32;
+        for cc in 0..hd { sum += k_cumdecay[t*hd+cc] * s_state[cc*hd+r]; }
+        v_prime[t*hd+r] = sum;
+    }}
+
+    // v_new = v_corr - v_prime
+    let mut v_new = vec![0.0f32; c * hd];
+    for i in 0..c*hd { v_new[i] = v_corr[i] - v_prime[i]; }
+
+    // attn_inter = (Q * exp(g)) @ S_state
+    let mut o_inter = vec![0.0f32; c * hd];
+    for i in 0..c {
+        let decay_i = g_cum[i].exp();
+        for r in 0..hd {
+            let mut sum = 0.0f32;
+            for cc in 0..hd { sum += q[i*hd+cc] * decay_i * s_state[cc*hd+r]; }
+            o_inter[i*hd+r] = sum;
+        }
+    }
+
+    // O = attn_inter + qk_decay @ v_new
+    for i in 0..c*hd { output[i] = o_inter[i]; }
+    for i in 0..c { for j in 0..=i {
+        let w = qk_decay[i*c+j];
+        for dd in 0..hd { output[i*hd+dd] += w * v_new[j*hd+dd]; }
+    }}
+
+    // State update: S = S * exp(g[-1]) + K_decayed^T @ v_new
+    let total_decay = g_cum[c-1].exp();
+    // HF: last_recurrent_state = last_recurrent_state * exp(g[:,:,i,-1,...])
+    //   + (k * exp(g[-1] - g).T) @ v_new
+    for r in 0..hd { for cc in 0..hd { s_state[r*hd+cc] *= total_decay; } }
+    for t in 0..c {
+        let decay_to_end = (g_cum[c-1] - g_cum[t]).exp();
+        for r in 0..hd { for cc in 0..hd {
+            // k[t] outer v_new[t], with k transposed: k[t][cc] * v_new[t][r]
+            // HF: (k * decay).transpose(-1,-2) @ v_new → matrix [hd × hd]
+            s_state[cc*hd+r] += k[t*hd+cc] * decay_to_end * v_new[t*hd+r];
+        }}
+    }
+    (output, s_state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunked_matches_sequential_zero_state() {
+        let hd = 4;
+        let n = 5;
+        let q: Vec<f32> = (0..n*hd).map(|i| ((i as f32*0.37+1.1).sin()*0.5)).collect();
+        let k: Vec<f32> = (0..n*hd).map(|i| ((i as f32*0.53+2.3).sin()*0.5)).collect();
+        let v: Vec<f32> = (0..n*hd).map(|i| ((i as f32*0.71+0.7).sin()*0.5)).collect();
+        let alpha: Vec<f32> = (0..n).map(|i| -0.5 - (i as f32 * 0.1)).collect();
+        let beta: Vec<f32> = (0..n).map(|i| 0.5 + (i as f32 * 0.05)).collect();
+        let s_in = vec![0.0f32; hd*hd];
+        let (os, ss) = deltanet_sequential_cpu(&q, &k, &v, &alpha, &beta, &s_in, n, hd);
+        let (oc, sc) = deltanet_chunked_cpu(&q, &k, &v, &alpha, &beta, &s_in, n, hd);
+        // Per-token output comparison
+        for t in 0..n {
+            let seq_norm: f32 = os[t*hd..(t+1)*hd].iter().map(|x| x*x).sum::<f32>().sqrt();
+            let ch_norm: f32 = oc[t*hd..(t+1)*hd].iter().map(|x| x*x).sum::<f32>().sqrt();
+            let err: f32 = os[t*hd..(t+1)*hd].iter().zip(&oc[t*hd..(t+1)*hd]).map(|(a,b)|(a-b).abs()).fold(0.0, f32::max);
+            eprintln!("  t={t}: seq_norm={seq_norm:.6} ch_norm={ch_norm:.6} max_err={err:.2e}");
+        }
+        let mo: f32 = os.iter().zip(&oc).map(|(a,b)|(a-b).abs()).fold(0.0, f32::max);
+        let ms: f32 = ss.iter().zip(&sc).map(|(a,b)|(a-b).abs()).fold(0.0, f32::max);
+        eprintln!("zero: out={mo:.2e} state={ms:.2e}");
+        assert!(mo < 1e-5, "out err {mo}"); assert!(ms < 1e-5, "state err {ms}");
+    }
+
+    #[test]
+    fn chunked_matches_sequential_nonzero_state() {
+        let hd = 4; let n = 3;
+        let q: Vec<f32> = (0..n*hd).map(|i| ((i as f32*0.41+0.3).cos()*0.3)).collect();
+        let k: Vec<f32> = (0..n*hd).map(|i| ((i as f32*0.67+1.5).sin()*0.4)).collect();
+        let v: Vec<f32> = (0..n*hd).map(|i| ((i as f32*0.29+2.1).cos()*0.6)).collect();
+        let alpha = vec![-0.3f32, -0.7, -0.5];
+        let beta = vec![0.6f32, 0.8, 0.5];
+        let s_in: Vec<f32> = (0..hd*hd).map(|i| ((i as f32*0.13+0.9).sin()*0.1)).collect();
+        let (os, ss) = deltanet_sequential_cpu(&q, &k, &v, &alpha, &beta, &s_in, n, hd);
+        let (oc, sc) = deltanet_chunked_cpu(&q, &k, &v, &alpha, &beta, &s_in, n, hd);
+        let mo: f32 = os.iter().zip(&oc).map(|(a,b)|(a-b).abs()).fold(0.0, f32::max);
+        let ms: f32 = ss.iter().zip(&sc).map(|(a,b)|(a-b).abs()).fold(0.0, f32::max);
+        eprintln!("nonzero: out={mo:.2e} state={ms:.2e}");
+        assert!(mo < 1e-5, "out err {mo}"); assert!(ms < 1e-5, "state err {ms}");
+    }
+
+    #[test]
+    fn chunked_larger_head_dim() {
+        let hd = 16; let n = 8;
+        let q: Vec<f32> = (0..n*hd).map(|i| ((i as f32*0.19+3.7).sin()*0.3)).collect();
+        let k: Vec<f32> = (0..n*hd).map(|i| ((i as f32*0.31+1.3).cos()*0.4)).collect();
+        let v: Vec<f32> = (0..n*hd).map(|i| ((i as f32*0.43+2.9).sin()*0.5)).collect();
+        let alpha: Vec<f32> = (0..n).map(|i| -0.2 - (i as f32 * 0.15)).collect();
+        let beta: Vec<f32> = (0..n).map(|i| 0.4 + (i as f32 * 0.07)).collect();
+        let s_in: Vec<f32> = (0..hd*hd).map(|i| ((i as f32*0.07+0.5).cos()*0.05)).collect();
+        let (os, ss) = deltanet_sequential_cpu(&q, &k, &v, &alpha, &beta, &s_in, n, hd);
+        let (oc, sc) = deltanet_chunked_cpu(&q, &k, &v, &alpha, &beta, &s_in, n, hd);
+        let mo: f32 = os.iter().zip(&oc).map(|(a,b)|(a-b).abs()).fold(0.0, f32::max);
+        let ms: f32 = ss.iter().zip(&sc).map(|(a,b)|(a-b).abs()).fold(0.0, f32::max);
+        eprintln!("hd16 n8: out={mo:.2e} state={ms:.2e}");
+        assert!(mo < 1e-4, "out err {mo}"); assert!(ms < 1e-4, "state err {ms}");
+    }
 }

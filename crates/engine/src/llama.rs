@@ -562,12 +562,15 @@ pub fn weight_gemm(
         DType::HFQ4G128 => gpu.gemm_hfq4g128(&w.buf, x, y, w.m, w.k, batch_size),
         _ => {
             // Fallback: repeated GEMV (no batched kernel for this format)
+            let x_tok = gpu.alloc_tensor(&[w.k], DType::F32)?;
+            let y_tok = gpu.alloc_tensor(&[w.m], DType::F32)?;
             for b in 0..batch_size {
-                // Create sub-tensor views — this is a hack, proper slicing needed
-                // For now, just use the non-batched path
-                return Err(hip_bridge::HipError::new(0,
-                    &format!("no batched GEMM for {:?}", w.gpu_dtype)));
+                gpu.hip.memcpy_dtod_at(&x_tok.buf, 0, &x.buf, b * w.k * 4, w.k * 4)?;
+                weight_gemv(gpu, w, &x_tok, &y_tok)?;
+                gpu.hip.memcpy_dtod_at(&y.buf, b * w.m * 4, &y_tok.buf, 0, w.m * 4)?;
             }
+            gpu.free_tensor(x_tok)?;
+            gpu.free_tensor(y_tok)?;
             Ok(())
         }
     }
@@ -1726,6 +1729,10 @@ pub fn argmax(logits: &[f32]) -> u32 {
 /// Single pass over raw logits to find top-K by value (no softmax on 151K vocab).
 /// Softmax only computed on the K=20 finalists.
 pub fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32) -> u32 {
+    if temperature <= 0.0 {
+        return argmax(logits);
+    }
+    let top_p = top_p.clamp(0.0, 1.0);
     const TOP_K: usize = 20;
 
     let inv_temp = 1.0 / temperature;
