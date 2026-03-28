@@ -2615,8 +2615,7 @@ impl Gpu {
             &mut sc as *mut _ as *mut c_void,
         ];
         let block_size = 32u32;
-        // shared: scores[seq_len] + q_rotated[head_dim]
-        let shared_mem = ((seq_len_hint + head_dim) * 4) as u32;
+        let shared_mem = (seq_len_hint * 4) as u32;  // scores only (FWHT is register-only)
         unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [block_size, 1, 1], shared_mem, self.stream_ref(), &mut params) }
     }
 

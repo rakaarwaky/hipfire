@@ -5080,36 +5080,15 @@ extern "C" __global__ void attention_turbo3_kv(
     const int dpt = head_dim / nthreads;
     const int d0 = tid * dpt;
 
-    float* scores = sdata;
-    float* q_rot = sdata + seq_len;
+    float* scores = sdata;  // only scores in shared memory
 
-    // Load Q into shared memory
-    for (int d = tid; d < head_dim; d += nthreads)
-        q_rot[d] = q[h * head_dim + d];
-    __syncthreads();
-
-    // Parallel FWHT forward on Q (all 32 threads)
-    for (int d = tid; d < head_dim; d += nthreads)
-        q_rot[d] *= signs1[d];
-    __syncthreads();
-    for (int stride = 1; stride < head_dim; stride <<= 1) {
-        for (int base = tid; base < head_dim / 2; base += nthreads) {
-            int blk = base / stride;
-            int j = base % stride;
-            int i = blk * stride * 2 + j;
-            float a = q_rot[i], b = q_rot[i + stride];
-            q_rot[i] = a + b; q_rot[i + stride] = a - b;
-        }
-        __syncthreads();
-    }
-    const float inv_sqrt = 0.08838834764831845f;
-    for (int d = tid; d < head_dim; d += nthreads)
-        q_rot[d] *= inv_sqrt * signs2[d];
-    __syncthreads();
-
-    // Cache my Q slice
-    float mq[4];
-    for (int i = 0; i < dpt; i++) mq[i] = q_rot[d0 + i];
+    // Register-only FWHT on Q
+    float mq0 = q[h * head_dim + d0];
+    float mq1 = q[h * head_dim + d0 + 1];
+    float mq2 = q[h * head_dim + d0 + 2];
+    float mq3 = q[h * head_dim + d0 + 3];
+    fwht_shfl_forward(mq0, mq1, mq2, mq3, signs1, signs2, tid);
+    float mq[4] = {mq0, mq1, mq2, mq3};
 
     // Phase 1: Q_rot @ K^T — warp-shuffle dot reduction
     for (int t = 0; t < seq_len; t++) {
@@ -5131,15 +5110,19 @@ extern "C" __global__ void attention_turbo3_kv(
     }
     __syncthreads();
 
-    // Softmax — thread 0 (seq_len small during decode)
-    if (tid == 0) {
-        float mx = -1e30f;
-        for (int t = 0; t < seq_len; t++) mx = fmaxf(mx, scores[t]);
-        float sm = 0.0f;
-        for (int t = 0; t < seq_len; t++) { float e = expf(scores[t] - mx); scores[t] = e; sm += e; }
-        float inv = 1.0f / sm;
-        for (int t = 0; t < seq_len; t++) scores[t] *= inv;
+    // Parallel softmax via warp shuffle
+    float lmx = -1e30f;
+    for (int t = tid; t < seq_len; t += nthreads) lmx = fmaxf(lmx, scores[t]);
+    for (int off = 16; off > 0; off >>= 1) lmx = fmaxf(lmx, __shfl_xor(lmx, off));
+    float mx = lmx;
+    float lsm = 0.0f;
+    for (int t = tid; t < seq_len; t += nthreads) {
+        float e = expf(scores[t] - mx); scores[t] = e; lsm += e;
     }
+    for (int off = 16; off > 0; off >>= 1) lsm += __shfl_xor(lsm, off);
+    __syncthreads();
+    float inv_sum = 1.0f / lsm;
+    for (int t = tid; t < seq_len; t += nthreads) scores[t] *= inv_sum;
     __syncthreads();
 
     // Phase 2: weighted V — each thread owns its dims
@@ -5159,30 +5142,11 @@ extern "C" __global__ void attention_turbo3_kv(
         }
     }
 
-    // Write V to shared, parallel inverse FWHT
-    for (int i = 0; i < dpt; i++) q_rot[d0 + i] = mv[i];
-    __syncthreads();
-
-    // Parallel inverse FWHT
-    for (int d = tid; d < head_dim; d += nthreads)
-        q_rot[d] *= signs2[d];
-    __syncthreads();
-    for (int stride = 1; stride < head_dim; stride <<= 1) {
-        for (int base = tid; base < head_dim / 2; base += nthreads) {
-            int blk = base / stride;
-            int j = base % stride;
-            int i = blk * stride * 2 + j;
-            float a = q_rot[i], b = q_rot[i + stride];
-            q_rot[i] = a + b; q_rot[i + stride] = a - b;
-        }
-        __syncthreads();
-    }
-    for (int d = tid; d < head_dim; d += nthreads)
-        q_rot[d] *= inv_sqrt * signs1[d];
-    __syncthreads();
+    // Register-only inverse FWHT
+    fwht_shfl_inverse(mv[0], mv[1], mv[2], mv[3], signs1, signs2, tid);
 
     float* oh = out + h * head_dim;
-    for (int d = tid; d < head_dim; d += nthreads) oh[d] = q_rot[d];
+    oh[d0] = mv[0]; oh[d0+1] = mv[1]; oh[d0+2] = mv[2]; oh[d0+3] = mv[3];
 }
 "#;
 
