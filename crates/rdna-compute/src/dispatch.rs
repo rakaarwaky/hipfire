@@ -36,7 +36,8 @@ pub enum DType {
     Q8HFQ,     // split-metadata: scales contiguous then values contiguous, 128B-aligned rows
     HFQ4G256,  // 136 bytes per 256 elements (flat 4-bit, f32 scale+zero, 18 VGPRs)
     HFQ4G128,  // 72 bytes per 128 elements (flat 4-bit, f32 scale+zero, 14 VGPRs)
-    HFQ2G256,  // 72 bytes per 256 elements (flat 2-bit, f32 scale+zero, ~18 VGPRs)
+    HFQ2G256,  // 72 bytes per 256 elements (flat 2-bit, f32 scale+zero, ~19 VGPRs)
+    HFQ2G128,  // 40 bytes per 128 elements (flat 2-bit, f32 scale+zero)
     HFQ6G256,  // 200 bytes per 256 elements (6-bit, f32 scale+zero)
     Raw,       // raw bytes, no element interpretation
 }
@@ -46,7 +47,7 @@ impl DType {
         match self {
             DType::F32 => 4,
             DType::F16 => 2,
-            DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q4F16G64 | DType::Q4F16G32 | DType::Q8HFQ | DType::HFQ4G256 | DType::HFQ4G128 | DType::HFQ2G256 | DType::HFQ6G256 | DType::Raw => 1, // byte-level
+            DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q4F16G64 | DType::Q4F16G32 | DType::Q8HFQ | DType::HFQ4G256 | DType::HFQ4G128 | DType::HFQ2G256 | DType::HFQ2G128 | DType::HFQ6G256 | DType::Raw => 1, // byte-level
         }
     }
 }
@@ -541,6 +542,20 @@ impl Gpu {
             &mut a_ptr as *mut _ as *mut c_void, &mut x_ptr as *mut _ as *mut c_void,
             &mut y_ptr as *mut _ as *mut c_void, &mut m_val as *mut _ as *mut c_void,
             &mut k_val as *mut _ as *mut c_void,
+        ];
+        unsafe { self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// HFQ2-G128 GEMV. K must be multiple of 128. Finer granularity than G256.
+    pub fn gemv_hfq2g128(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
+        self.ensure_kernel("gemv_hfq2g128", kernels::GEMV_HFQ2G128_SRC, "gemv_hfq2g128")?;
+        let func = &self.functions["gemv_hfq2g128"];
+        let mut ap = a_raw.buf.as_ptr(); let mut xp = x.buf.as_ptr(); let mut yp = y.buf.as_ptr();
+        let mut mv = m as i32; let mut kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void, &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void, &mut mv as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
         ];
         unsafe { self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
     }

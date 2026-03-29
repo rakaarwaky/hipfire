@@ -484,6 +484,47 @@ fn quantize_hfq2g256(f32_data: &[f32]) -> Vec<u8> {
     output
 }
 
+/// Quantize F32 weights to HFQ2-G128: 2-bit with 128-weight groups (finer granularity).
+/// Block: [f32 scale][f32 zero][32B packed 2-bit] = 40 bytes per 128 weights (0.3125 B/w).
+fn quantize_hfq2g128(f32_data: &[f32]) -> Vec<u8> {
+    let group_size = 128;
+    let block_bytes = 40;
+    let n = f32_data.len();
+    let n_blocks = (n + group_size - 1) / group_size;
+    let mut output = vec![0u8; n_blocks * block_bytes];
+
+    for b in 0..n_blocks {
+        let start = b * group_size;
+        let end = (start + group_size).min(n);
+        let group = &f32_data[start..end];
+
+        let min_val = group.iter().cloned().fold(f32::INFINITY, f32::min);
+        let max_val = group.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+
+        let range = max_val - min_val;
+        let scale = if range > 0.0 { range / 3.0 } else { 1.0 };
+        let inv_scale = if range > 0.0 { 1.0 / scale } else { 0.0 };
+
+        let out_off = b * block_bytes;
+        output[out_off..out_off + 4].copy_from_slice(&scale.to_le_bytes());
+        output[out_off + 4..out_off + 8].copy_from_slice(&min_val.to_le_bytes());
+
+        let actual_len = end - start;
+        for i in 0..32 {
+            let mut byte_val = 0u8;
+            for j in 0..4 {
+                let idx = 4 * i + j;
+                let val = if idx < actual_len { group[idx] } else { min_val };
+                let q = ((val - min_val) * inv_scale + 0.5) as u8;
+                byte_val |= q.min(3) << (j * 2);
+            }
+            output[out_off + 8 + i] = byte_val;
+        }
+    }
+
+    output
+}
+
 /// Quantize F32 weights to HFQ6-G256: 6-bit with 256-weight groups.
 /// Block: [f32 scale][f32 zero][192B packed 6-bit] = 200 bytes per 256 weights (0.78125 B/w).
 fn quantize_hfq6g256(f32_data: &[f32]) -> Vec<u8> {
@@ -590,6 +631,7 @@ enum QuantType {
     HFQ4G128 = 7,
     HFQ6G256 = 8,
     HFQ2G256 = 9,
+    HFQ2G128 = 10,
 }
 
 struct HfqTensor {
@@ -797,7 +839,8 @@ fn main() {
     let use_q4k_all = format == "q4k";
     let use_q4k_q8embed = format == "q4k-q8embed";
     let use_hfq4g256 = format == "hfq4g256" || format == "hfq4";
-    let use_hfq2g256 = format == "hfq2g256" || format == "hfq2";
+    let use_hfq2g256 = format == "hfq2g256";
+    let use_hfq2g128 = format == "hfq2g128" || format == "hfq2";  // default HFQ2 = G128 (better quality)
     let use_hfq_mixed = format == "hfq-mixed";  // Q8 attn + HFQ4 FFN
     let use_hfq6 = format == "hfq6" || format == "hfq6g256";
 
@@ -981,10 +1024,12 @@ fn main() {
                     let q = quantize_hfq6g256(&f32_data);
                     (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
                 }
-            } else if use_hfq2g256 && is_embed {
-                // Q8 embeddings for HFQ2 (2-bit too lossy for embeddings)
+            } else if (use_hfq2g256 || use_hfq2g128) && is_embed {
                 let q = quantize_q8f16(&f32_data);
                 (q, QuantType::Q8F16, 32u32, "Q8_F16")
+            } else if use_hfq2g128 {
+                let q = quantize_hfq2g128(&f32_data);
+                (q, QuantType::HFQ2G128, 128u32, "HFQ2G128")
             } else if use_hfq2g256 {
                 let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
                 if k_dim % 256 == 0 {

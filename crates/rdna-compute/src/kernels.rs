@@ -716,6 +716,52 @@ extern "C" __global__ void gemv_hfq4g256(
 }
 "#;
 
+
+/// HFQ2-G128: flat 2-bit with 128-weight groups. Finer granularity than G256.
+/// [f32 scale (4B)][f32 zero (4B)][2-bit × 128 (32B)] = 40 bytes per 128 weights (0.3125 B/w).
+/// 32 threads × 4 elements = 128 per group. Each thread reads 1 byte.
+pub const GEMV_HFQ2G128_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+__launch_bounds__(32, 20)
+extern "C" __global__ void gemv_hfq2g128(
+    const char* __restrict__ A,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M, int K
+) {
+    const int row = blockIdx.x;
+    if (row >= M) return;
+    const int tid = threadIdx.x;
+
+    const int groups_per_row = K / 128;
+    const int row_bytes = groups_per_row * 40;
+    const char* row_ptr = A + (long long)row * row_bytes;
+
+    float acc = 0.0f;
+
+    for (int g = 0; g < groups_per_row; g++) {
+        const char* gptr = row_ptr + g * 40;
+        float scale = __builtin_bit_cast(float, *(const unsigned int*)(gptr));
+        float zero  = __builtin_bit_cast(float, *(const unsigned int*)(gptr + 4));
+
+        // 128 weights / 32 threads = 4 weights per thread = 1 byte
+        int base_idx = g * 128 + tid * 4;
+        unsigned char b = *((const unsigned char*)(gptr + 8 + tid));
+
+        acc += (scale * (float)((b)      & 0x3) + zero) * x[base_idx]
+             + (scale * (float)((b >> 2) & 0x3) + zero) * x[base_idx + 1]
+             + (scale * (float)((b >> 4) & 0x3) + zero) * x[base_idx + 2]
+             + (scale * (float)((b >> 6))       + zero) * x[base_idx + 3];
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_down(acc, offset);
+
+    if (tid == 0) y[row] = acc;
+}
+"#;
+
 /// HFQ4-G256 wide GEMV: 2 rows per block (64 threads = 2 warps).
 /// Each warp processes one row independently. Halves grid size.
 pub const GEMV_HFQ4G256_WIDE_SRC: &str = r#"
