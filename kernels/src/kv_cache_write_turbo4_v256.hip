@@ -53,28 +53,37 @@ extern "C" __global__ void kv_cache_write_turbo4_v256(
     // FWHT-256 forward (register-only + warp shuffle)
     fwht_shfl_forward_256(v0, v1, v2, v3, v4, v5, v6, v7, signs1, signs2, tid);
 
-    // 4-bit quantize from registers
+    // 4-bit quantize + pack in two batches of 4 to reduce live VGPRs
     float local_rsq = 0.0f;
-    int i0 = turbo_quantize_4bit(v0); local_rsq += TURBO_C4[i0] * TURBO_C4[i0];
-    int i1 = turbo_quantize_4bit(v1); local_rsq += TURBO_C4[i1] * TURBO_C4[i1];
-    int i2 = turbo_quantize_4bit(v2); local_rsq += TURBO_C4[i2] * TURBO_C4[i2];
-    int i3 = turbo_quantize_4bit(v3); local_rsq += TURBO_C4[i3] * TURBO_C4[i3];
-    int i4 = turbo_quantize_4bit(v4); local_rsq += TURBO_C4[i4] * TURBO_C4[i4];
-    int i5 = turbo_quantize_4bit(v5); local_rsq += TURBO_C4[i5] * TURBO_C4[i5];
-    int i6 = turbo_quantize_4bit(v6); local_rsq += TURBO_C4[i6] * TURBO_C4[i6];
-    int i7 = turbo_quantize_4bit(v7); local_rsq += TURBO_C4[i7] * TURBO_C4[i7];
+    int ia, ib;
 
-    // Norm correction via warp reduction
+    // Batch 1: v0-v3
+    ia = turbo_quantize_4bit(v0); local_rsq += TURBO_C4[ia] * TURBO_C4[ia];
+    ib = turbo_quantize_4bit(v1); local_rsq += TURBO_C4[ib] * TURBO_C4[ib];
+    unsigned char p0 = (unsigned char)((ib << 4) | (ia & 0xF));
+    ia = turbo_quantize_4bit(v2); local_rsq += TURBO_C4[ia] * TURBO_C4[ia];
+    ib = turbo_quantize_4bit(v3); local_rsq += TURBO_C4[ib] * TURBO_C4[ib];
+    unsigned char p1 = (unsigned char)((ib << 4) | (ia & 0xF));
+
+    // Batch 2: v4-v7
+    ia = turbo_quantize_4bit(v4); local_rsq += TURBO_C4[ia] * TURBO_C4[ia];
+    ib = turbo_quantize_4bit(v5); local_rsq += TURBO_C4[ib] * TURBO_C4[ib];
+    unsigned char p2 = (unsigned char)((ib << 4) | (ia & 0xF));
+    ia = turbo_quantize_4bit(v6); local_rsq += TURBO_C4[ia] * TURBO_C4[ia];
+    ib = turbo_quantize_4bit(v7); local_rsq += TURBO_C4[ib] * TURBO_C4[ib];
+    unsigned char p3 = (unsigned char)((ib << 4) | (ia & 0xF));
+
+    // Store packed nibbles immediately (frees p0-p3 before norm reduction)
+    out[4 + tid * 4]     = p0;
+    out[4 + tid * 4 + 1] = p1;
+    out[4 + tid * 4 + 2] = p2;
+    out[4 + tid * 4 + 3] = p3;
+
+    // Norm correction via warp reduction (p0-p3 now dead)
     scratch[tid] = local_rsq;
     __syncthreads();
     for (int s = 16; s > 0; s >>= 1) { if (tid < s) scratch[tid] += scratch[tid + s]; __syncthreads(); }
     float recon_norm = sqrtf(scratch[0]);
     float cnorm = (recon_norm > 1e-10f) ? orig_norm / recon_norm : orig_norm;
     if (tid == 0) *(float*)out = cnorm;
-
-    // Pack 8 nibbles into 4 bytes
-    out[4 + tid * 4]     = (unsigned char)((i1 << 4) | (i0 & 0xF));
-    out[4 + tid * 4 + 1] = (unsigned char)((i3 << 4) | (i2 & 0xF));
-    out[4 + tid * 4 + 2] = (unsigned char)((i5 << 4) | (i4 & 0xF));
-    out[4 + tid * 4 + 3] = (unsigned char)((i7 << 4) | (i6 & 0xF));
 }
