@@ -101,6 +101,28 @@ impl HipRuntime {
     /// Load the HIP runtime via dlopen.
     /// Searches standard paths: /opt/rocm/lib, system library path.
     pub fn load() -> HipResult<Self> {
+        #[cfg(target_os = "windows")]
+        let lib = unsafe {
+            let userprofile = std::env::var("USERPROFILE").unwrap_or_default();
+            let hip_path = std::env::var("HIP_PATH").unwrap_or_default();
+            let p1 = format!(r"{userprofile}\.hipfire\runtime\amdhip64.dll");
+            let p2 = format!(r"{hip_path}\bin\amdhip64.dll");
+            Library::new(&p1)
+                .or_else(|_| Library::new(&p2))
+                .or_else(|_| Library::new("amdhip64.dll"))
+                .map_err(|e| {
+                    HipError::new(
+                        0,
+                        &format!(
+                            "failed to load amdhip64.dll: {e}. \
+                             Searched: {p1}, {p2}, amdhip64.dll (PATH). \
+                             Is ROCm/HIP installed?"
+                        ),
+                    )
+                })?
+        };
+
+        #[cfg(not(target_os = "windows"))]
         let lib = unsafe {
             Library::new("libamdhip64.so").map_err(|e| {
                 HipError::new(
