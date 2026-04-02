@@ -554,6 +554,12 @@ pub const BIAS_ADD_SRC: &str = include_str!("../../../kernels/src/bias_add.hip")
 
 
 
+// Symmetric turbo for head_dim=256 (both K and V quantized)
+pub const KV_CACHE_WRITE_TURBO4_256_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_turbo4_256.hip");
+pub const ATTENTION_TURBO4_KV_256_SRC: &str = include_str!("../../../kernels/src/attention_turbo4_kv_256.hip");
+pub const KV_CACHE_WRITE_TURBO2_256_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_turbo2_256.hip");
+pub const ATTENTION_TURBO2_KV_256_SRC: &str = include_str!("../../../kernels/src/attention_turbo2_kv_256.hip");
+
 // Asymmetric turbo: Q8 K + turbo4 V for head_dim=256
 pub const KV_CACHE_WRITE_TURBO4_V256_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_turbo4_v256.hip");
 pub const ATTENTION_Q8K_TURBO4V_256_SRC: &str = include_str!("../../../kernels/src/attention_q8k_turbo4v_256.hip");

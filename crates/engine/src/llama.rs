@@ -1973,7 +1973,7 @@ impl KvCache {
     ) -> HipResult<Self> {
         let real_bits = if bits == 12 { 2u8 } else { bits };
         assert!(real_bits == 2 || real_bits == 3 || real_bits == 4, "turbo bits must be 2, 3, 4, or 12");
-        assert!(head_dim == 128, "turbo KV cache requires head_dim=128 (got {head_dim})");
+        assert!(head_dim == 128 || head_dim == 256, "turbo KV cache requires head_dim=128 or 256 (got {head_dim})");
 
         let kv_dim = n_kv_heads * head_dim;
         let turbo_bytes_per_head = match real_bits {

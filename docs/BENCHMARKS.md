@@ -1,67 +1,87 @@
 # hipfire Benchmarks
 
 Hardware: AMD Radeon RX 5700 XT (8GB VRAM, RDNA1 gfx1010, 448 GB/s peak)
-Branch: `web` (TurboQuant KV cache + restore baseline)
-Date: 2026-03-27
+Date: 2026-04-02
 
-## TurboQuant KV Cache — Qwen3-8B HFQ4-G256
+## Qwen3.5 DeltaNet — Full Model Matrix
 
-### Speed (warm kernel cache, greedy sampling)
+All models, Q8 KV (default), `--no-think`, averaged across 4 prompts:
 
-| Config | Short (91 tok) | Hard (128 tok) | KV Compression | KV bytes/head |
-|--------|---------------|----------------|----------------|---------------|
-| Q8 KV (baseline) | **59.9 tok/s** | **58.8 tok/s** | 3.88x | 132 |
-| FP32 KV | 57.0 | — | 1.0x | 512 |
-| turbo2 (2-bit) | 54.1 | 51.8 | **14.2x** | 36 |
-| turbo2+adaptive | 54.2 | — | ~10x | 36/512 |
-| turbo3 (3-bit) | 50.8 | 44.5 | 9.85x | 52 |
-| turbo4 (4-bit) | 53.6 | 51.0 | 7.5x | 68 |
-| turbo4+adaptive | 53.7 | 51.2 | ~5x | 68/512 |
+| Model | Quant | tok/s | Quality | VRAM |
+|-------|-------|-------|---------|------|
+| Qwen3.5-0.8B | HFQ4 | **222** | OK | ~600MB |
+| Qwen3.5-0.8B | HFQ6 | **210** | OK | ~750MB |
+| Qwen3.5-2B | HFQ4 | **141** | OK | ~1.5GB |
+| Qwen3.5-2B | HFQ6 | **127** | OK | ~2GB |
+| Qwen3.5-4B | HFQ4 | **63** | OK | ~2.5GB |
+| Qwen3.5-4B | HFQ6 | **53** | OK | ~3.5GB |
+| Qwen3.5-9B | HFQ4 | **45** | OK | ~5.5GB |
+| Qwen3.5-9B | HFQ6 | **37** | OK | ~7.5GB |
 
-Short = "Hello" with ChatML wrapping (9 prompt tokens, 91 generated).
-Hard = "Explain the three laws of thermodynamics with mathematical formulations and real-world examples" (128 generated).
-Adaptive = first and last layers use FP32 KV, middle layers use turbo.
+Notes:
+- HFQ4 = 4-bit (0.53 B/w). Best speed, good quality.
+- HFQ6 = 6-bit (0.78 B/w). Better quality, ~15% slower.
+- All models: DeltaNet hybrid attention (linear + full attention layers).
+- 9B HFQ6 barely fits in 8GB — usable but tight.
 
-### Quality verification
+## TurboQuant KV Cache — Qwen3.5 (head_dim=256)
 
-All turbo configs produce **coherent, topical output** on the hard prompt (thermodynamics explanation with correct concepts, mathematical references, multi-paragraph reasoning). No repetition loops, no garbage tokens.
+Tested on "Compare TCP/UDP protocols" prompt:
 
-Sample turbo4 output (hard prompt):
-> The Zeroth Law: If two systems are each in thermal equilibrium with a third system, then they are in thermal equilibrium with each other. The first law is about energy conservation: ΔU = Q - W...
+| Model | KV Mode | tok/s | Compression | Quality |
+|-------|---------|-------|-------------|---------|
+| 4B-Q4 | Q8 (default) | **62.6** | 3.8x | OK |
+| 4B-Q4 | Turbo4 | **60.9** | 7.8x | OK |
+| 4B-Q4 | Turbo2 | **58.5** | 15.5x | OK |
+| 9B-Q4 | Q8 (default) | **43.4** | 3.8x | OK |
+| 9B-Q4 | Turbo4 | **42.3** | 7.8x | OK |
+| 9B-Q4 | Turbo2 | **35.9** | 15.5x | degraded |
 
-### KV cache memory at 2048 context
+Notes:
+- Turbo4: FWHT-256 + 4-bit quantize. 7.8x compression, minimal quality loss. Recommended.
+- Turbo2: FWHT-256 + 2-bit quantize. 15.5x compression. Works on 4B, degrades on 9B.
+- New 256-dim kernels: `attention_turbo4_kv_256.hip`, `kv_cache_write_turbo4_256.hip` (and turbo2 variants).
+- 32 threads (one RDNA wavefront) × 8 dims/thread. FWHT-256 via warp shuffle. ~28 VGPRs.
 
-| Config | Qwen3-8B (32 kv_heads, 128 hd, 36 layers) |
-|--------|---------------------------------------------|
-| FP32 | 1.07 GB |
-| Q8 | 536 MB |
-| turbo4 | 278 MB |
-| turbo3 | 213 MB |
-| turbo2 | **147 MB** |
+## Long Context Stress Test
 
-### Key findings
+~400 token input, 512 token generation:
 
-1. **TurboQuant works on RDNA1.** All three bit-widths (2/3/4) produce coherent output with FWHT + norm correction + Lloyd-Max centroids.
+| Model | KV Mode | tok/s | Quality |
+|-------|---------|-------|---------|
+| 4B-Q4 | Q8 | **59.8** | OK |
+| 4B-Q4 | Turbo4 | **50.4** | OK |
+| 4B-Q4 | Turbo2 | **48.0** | OK |
+| 9B-Q4 | Turbo4 | **38.0** | OK |
 
-2. **FWHT is irreducible.** Tested 5 cheaper transforms (sign flip, permutation, sign+permute, 2-stage butterfly, none). All produce garbage at 2-bit and degrade on hard prompts at 4-bit. The full 7-stride Walsh-Hadamard butterfly is necessary for quality.
+Turbo4 enables ~2x longer context than Q8 in the same VRAM budget.
 
-3. **Norm correction is critical.** Storing `original_norm / reconstruction_norm` per head preserves exact L2 norm through quantization. This is what makes turbo beat Q8 in quality for recurrent architectures (DeltaNet).
+## TurboQuant KV Cache — Qwen3-8B (head_dim=128)
 
-4. **Speed overhead is 10% vs Q8.** The FWHT costs ~5 tok/s at short context. At longer context where KV bandwidth dominates, turbo should match or beat Q8.
+From earlier benchmarks (2026-03-27):
 
-5. **turbo2 (2-bit) is the compression champion.** 14.2x compression vs fp32, only 10% slower than Q8, coherent output on hard prompts. Enables 3.65x more context in the same VRAM.
+| Config | Short (91 tok) | Hard (128 tok) | KV Compression |
+|--------|---------------|----------------|----------------|
+| Q8 KV (baseline) | **59.9 tok/s** | **58.8 tok/s** | 3.88x |
+| FP32 KV | 57.0 | — | 1.0x |
+| turbo2 (2-bit) | 54.1 | 51.8 | **14.2x** |
+| turbo3 (3-bit) | 50.8 | 44.5 | 9.85x |
+| turbo4 (4-bit) | 53.6 | 51.0 | 7.5x |
 
-## Qwen3-0.6B HFQ4 (weight quantization benchmarks)
+## Comparison vs llama.cpp + ROCm
 
-| Config | Short gen | Long gen | Prefill |
-|--------|-----------|----------|---------|
-| HFQ4-G256 + Q8 KV | 262.5 tok/s | 235.0 | 1263 |
-| HFQ4 auto + Q8 KV | 238.3 | — | 1370 |
-| Q8 weights + Q8 KV | 219.0 | 184.2 | 358 |
+| Setup | Model | tok/s |
+|-------|-------|-------|
+| **hipfire** | Qwen3.5-9B HFQ4 | **45** |
+| **hipfire** | Qwen3.5-4B HFQ4 | **63** |
+| **hipfire** | Qwen3.5-0.8B HFQ4 | **222** |
+| ollama (llama.cpp) | Qwen3.5-9B Q4 | 4.93 |
+
+hipfire is **9x faster** than llama.cpp+ROCm on the same hardware for Qwen3.5 models.
 
 ## Notes
 
-- All benchmarks use greedy decoding (temp=0) with ChatML auto-detection.
-- Kernel cache warm (cold compile excluded from measurements).
-- turbo KV requires head_dim=128 (Qwen3-8B, Llama 8B). Qwen3-0.6B (head_dim=64) uses Q8 KV.
-- Repetition penalty: 1.1, window: 64 tokens.
+- All benchmarks use ChatML prompting, greedy decoding (temp=0.3), repeat penalty 1.3.
+- Kernel cache warm (first-run compilation excluded).
+- Turbo KV supports head_dim=128 (Qwen3) and head_dim=256 (Qwen3.5).
+- Quality rated by automated coherence check: repetition frequency + output length.

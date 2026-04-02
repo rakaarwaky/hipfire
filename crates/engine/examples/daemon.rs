@@ -4,8 +4,9 @@
 //!
 //! Protocol:
 //!   → {"type":"load","model":"path.hfq","params":{"max_seq":4096}}
-//!   ← {"type":"loaded","arch":"qwen3_5","dim":4096,"layers":32,"vocab":248320}
+//!   ← {"type":"loaded","arch":"qwen3_5","dim":4096,"layers":32,"vocab":248320,"vl":true}
 //!   → {"type":"generate","id":"r1","prompt":"Hello","temperature":0.3,"max_tokens":512}
+//!   → {"type":"generate","id":"r1","prompt":"Describe this","image":"/path/to/img.png","temperature":0.3,"max_tokens":512}
 //!   ← {"type":"token","id":"r1","text":"The"}
 //!   ← {"type":"done","id":"r1","tokens":42,"tok_s":44.5}
 //!   → {"type":"unload"}
@@ -15,9 +16,15 @@ use engine::hfq::HfqFile;
 use engine::llama;
 use engine::qwen35;
 use engine::qwen35::DeltaNetState;
+use engine::qwen35_vl;
 use std::io::{BufRead, Write};
 use std::path::Path;
 use std::time::Instant;
+
+const IMAGE_SIZE: usize = 448;
+const IMAGE_PAD_ID: u32 = 248056;
+const VISION_START_ID: u32 = 248053;
+const VISION_END_ID: u32 = 248054;
 
 struct LoadedModel {
     arch_id: u32,
@@ -32,6 +39,9 @@ struct LoadedModel {
     llama_weights: Option<llama::LlamaWeights>,
     llama_scratch: Option<llama::ForwardScratch>,
     llama_kv: Option<llama::KvCache>,
+    // Vision state (VL models only)
+    vision_config: Option<qwen35_vl::VisionConfig>,
+    vision_weights: Option<qwen35_vl::VisionWeights>,
     // Shared
     tokenizer: Option<engine::tokenizer::Tokenizer>,
 }
@@ -74,12 +84,13 @@ fn main() {
                 match load_model(path, max_seq, &mut gpu) {
                     Ok(m) => {
                         let arch = if m.arch_id == 5 { "qwen3_5" } else { "qwen3" };
+                        let vl = m.vision_config.is_some();
                         let (dim, layers, vocab) = if let Some(ref c) = m.q35_config {
                             (c.dim, c.n_layers, c.vocab_size)
                         } else if let Some(ref c) = m.llama_config {
                             (c.dim, c.n_layers, c.vocab_size)
                         } else { (0, 0, 0) };
-                        let _ = writeln!(stdout, r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{}}}"#, arch, dim, layers, vocab);
+                        let _ = writeln!(stdout, r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{}}}"#, arch, dim, layers, vocab, vl);
                         model = Some(m);
                     }
                     Err(e) => {
@@ -101,10 +112,15 @@ fn main() {
 
                 let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("0");
                 let prompt = msg.get("prompt").and_then(|v| v.as_str()).unwrap_or("Hello");
+                let image = msg.get("image").and_then(|v| v.as_str());
                 let temp = msg.get("temperature").and_then(|v| v.as_f64()).unwrap_or(0.3) as f32;
                 let max_tokens = msg.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(512) as usize;
 
-                generate(m, &mut gpu, &mut stdout, id, prompt, temp, max_tokens);
+                if image.is_some() && m.vision_config.is_some() {
+                    generate_vl(m, &mut gpu, &mut stdout, id, prompt, image.unwrap(), temp, max_tokens);
+                } else {
+                    generate(m, &mut gpu, &mut stdout, id, prompt, temp, max_tokens);
+                }
             }
 
             "unload" => {
@@ -136,6 +152,16 @@ fn load_model(path: &str, max_seq: usize, gpu: &mut rdna_compute::Gpu) -> Result
     if hfq.arch_id == 5 {
         // Qwen3.5 DeltaNet
         let config = qwen35::config_from_hfq(&hfq).ok_or("failed to read Qwen3.5 config")?;
+
+        // Detect and load vision weights if this is a VL model
+        let vision_config = qwen35_vl::vision_config_from_hfq(&hfq);
+        let vision_weights = if let Some(ref vc) = vision_config {
+            eprintln!("  VL model: loading vision encoder (hidden={}, layers={})", vc.hidden_size, vc.num_layers);
+            Some(qwen35_vl::load_vision_weights(&hfq, vc, gpu).map_err(|e| format!("{e}"))?)
+        } else {
+            None
+        };
+
         let weights = qwen35::load_weights(&hfq, &config, gpu).map_err(|e| format!("{e}"))?;
         let kv = llama::KvCache::new_gpu_q8(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq).map_err(|e| format!("{e}"))?;
         let dn = DeltaNetState::new(gpu, &config).map_err(|e| format!("{e}"))?;
@@ -145,6 +171,7 @@ fn load_model(path: &str, max_seq: usize, gpu: &mut rdna_compute::Gpu) -> Result
             q35_config: Some(config), q35_weights: Some(weights), q35_scratch: Some(scratch),
             kv_cache: Some(kv), dn_state: Some(dn),
             llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
+            vision_config, vision_weights,
             tokenizer: Some(tokenizer),
         })
     } else {
@@ -158,6 +185,7 @@ fn load_model(path: &str, max_seq: usize, gpu: &mut rdna_compute::Gpu) -> Result
             q35_config: None, q35_weights: None, q35_scratch: None,
             kv_cache: None, dn_state: None,
             llama_config: Some(config), llama_weights: Some(weights), llama_scratch: Some(scratch), llama_kv: Some(kv),
+            vision_config: None, vision_weights: None,
             tokenizer: Some(tokenizer),
         })
     }
@@ -283,4 +311,99 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         let _ = writeln!(stdout, r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1}}}"#, id, generated, tok_s);
         let _ = stdout.flush();
     }
+}
+
+fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, image_path: &str, temp: f32, max_tokens: usize) {
+    let tokenizer = m.tokenizer.as_ref().unwrap();
+    let config = m.q35_config.as_ref().unwrap();
+    let vision_config = m.vision_config.as_ref().unwrap();
+    let vision_weights = m.vision_weights.as_ref().unwrap();
+    let weights = m.q35_weights.as_ref().unwrap();
+    let scratch = m.q35_scratch.as_ref().unwrap();
+    let kv = m.kv_cache.as_mut().unwrap();
+    let dn = m.dn_state.as_mut().unwrap();
+
+    // Load and preprocess image
+    let pixels = engine::image::load_and_preprocess(Path::new(image_path), IMAGE_SIZE);
+    let grid_h = IMAGE_SIZE / vision_config.patch_size;
+    let grid_w = IMAGE_SIZE / vision_config.patch_size;
+    let n_patches = grid_h * grid_w;
+    let n_visual_tokens = n_patches / (vision_config.spatial_merge_size * vision_config.spatial_merge_size);
+
+    // Extract patches and run vision encoder
+    let patches = engine::image::extract_patches(
+        &pixels, 3, IMAGE_SIZE, IMAGE_SIZE,
+        vision_config.patch_size, vision_config.temporal_patch_size,
+    );
+    let visual_tokens = qwen35_vl::vision_forward(gpu, vision_weights, vision_config, &patches, grid_h, grid_w)
+        .expect("vision forward failed");
+
+    // Build VL prompt: <|im_start|>user\n<|vision_start|><|image_pad|>×N<|vision_end|>\n{question}<|im_end|>\n<|im_start|>assistant\n
+    let im_start = tokenizer.encode("<|im_start|>");
+    let im_end = tokenizer.encode("<|im_end|>");
+    let nl = tokenizer.encode("\n");
+    let user_tok = tokenizer.encode("user");
+    let asst_tok = tokenizer.encode("assistant");
+    let q_tokens = tokenizer.encode(prompt);
+
+    let mut prompt_tokens: Vec<u32> = Vec::new();
+    prompt_tokens.extend_from_slice(&im_start);
+    prompt_tokens.extend_from_slice(&user_tok);
+    prompt_tokens.extend_from_slice(&nl);
+    prompt_tokens.push(VISION_START_ID);
+    for _ in 0..n_visual_tokens {
+        prompt_tokens.push(IMAGE_PAD_ID);
+    }
+    prompt_tokens.push(VISION_END_ID);
+    prompt_tokens.extend_from_slice(&nl);
+    prompt_tokens.extend_from_slice(&q_tokens);
+    prompt_tokens.extend_from_slice(&im_end);
+    prompt_tokens.extend_from_slice(&nl);
+    prompt_tokens.extend_from_slice(&im_start);
+    prompt_tokens.extend_from_slice(&asst_tok);
+    prompt_tokens.extend_from_slice(&nl);
+
+    let im_end_token = if im_end.len() == 1 { Some(im_end[0]) } else { None };
+    let t0 = Instant::now();
+
+    // Prefill with vision token embedding for IMAGE_PAD positions
+    let mut visual_idx = 0usize;
+    for (pos, &token) in prompt_tokens.iter().enumerate() {
+        if token == IMAGE_PAD_ID && visual_idx < n_visual_tokens {
+            let emb = &visual_tokens[visual_idx * config.dim..(visual_idx + 1) * config.dim];
+            qwen35::forward_scratch_embed(gpu, weights, config, emb, pos, kv, dn, scratch)
+                .expect("forward_scratch_embed failed");
+            visual_idx += 1;
+        } else {
+            qwen35::forward_scratch(gpu, weights, config, token, pos, kv, dn, scratch)
+                .expect("forward_scratch failed");
+        }
+    }
+
+    // Generate
+    let mut logits = gpu.download_f32(&scratch.logits).unwrap();
+    let mut next_token = llama::sample_top_p(&logits, temp, 0.8);
+    let mut generated = 0;
+    let mut token_history = prompt_tokens.clone();
+
+    for _ in 0..max_tokens {
+        generated += 1;
+        token_history.push(next_token);
+        let text = tokenizer.decode(&[next_token]);
+        let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
+        let _ = stdout.flush();
+
+        if next_token == config.eos_token { break; }
+        if im_end_token == Some(next_token) { break; }
+
+        let pos = prompt_tokens.len() + generated - 1;
+        qwen35::forward_scratch(gpu, weights, config, next_token, pos, kv, dn, scratch).unwrap();
+        logits = gpu.download_f32(&scratch.logits).unwrap();
+        llama::apply_repeat_penalty(&mut logits, &token_history, 128, 1.3);
+        next_token = llama::sample_top_p(&logits, temp, 0.8);
+    }
+
+    let tok_s = generated as f64 / t0.elapsed().as_secs_f64();
+    let _ = writeln!(stdout, r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1}}}"#, id, generated, tok_s);
+    let _ = stdout.flush();
 }

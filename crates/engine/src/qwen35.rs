@@ -241,6 +241,10 @@ fn load_weight_tensor_raw(gpu: &Gpu, quant_type: u8, data: &[u8], m: usize, k: u
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::HFQ4G128, m, k, row_stride: 0 })
         }
+        8 => {
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ6G256, m, k, row_stride: 0 })
+        }
         3 => {
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k, row_stride: 0 })
@@ -273,6 +277,10 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, name: &str, m: usize, k: usize) 
         7 => { // HFQ4-G128
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::HFQ4G128, m, k, row_stride: 0 })
+        }
+        8 => { // HFQ6-G256
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ6G256, m, k, row_stride: 0 })
         }
         3 => { // Q8_0
             let buf = gpu.upload_raw(data, &[data.len()])?;
@@ -322,6 +330,34 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
             }
             out
         }
+        8 => {
+            // HFQ6-G256 — CPU dequant: [f32 scale][f32 zero][192B packed 6-bit] = 200 bytes per 256 weights
+            let group_size: usize = 256;
+            let bytes_per_group: usize = 200; // 8 + 192
+            let n_groups = data.len() / bytes_per_group;
+            let mut out = Vec::with_capacity(n_groups * group_size);
+            for g in 0..n_groups {
+                let off = g * bytes_per_group;
+                let scale = f32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
+                let zero = f32::from_le_bytes([data[off+4], data[off+5], data[off+6], data[off+7]]);
+                // 4 values per 3 bytes: v0[5:0]|v1[1:0], v1[5:2]|v2[3:0], v2[5:4]|v3[5:0]
+                for i in (0..group_size).step_by(4) {
+                    let byte_off = 8 + (i / 4) * 3;
+                    let b0 = data[off + byte_off] as u32;
+                    let b1 = data[off + byte_off + 1] as u32;
+                    let b2 = data[off + byte_off + 2] as u32;
+                    let q0 = (b0 & 0x3F) as f32;
+                    let q1 = (((b0 >> 6) | (b1 << 2)) & 0x3F) as f32;
+                    let q2 = (((b1 >> 4) | (b2 << 4)) & 0x3F) as f32;
+                    let q3 = ((b2 >> 2) & 0x3F) as f32;
+                    out.push(scale * q0 + zero);
+                    out.push(scale * q1 + zero);
+                    out.push(scale * q2 + zero);
+                    out.push(scale * q3 + zero);
+                }
+            }
+            out
+        }
         _ => panic!("unsupported quant_type {} for {name}", info.quant_type),
     };
     gpu.upload_f32(&f32_data[..n], &[n])
@@ -365,9 +401,11 @@ pub fn load_weights(hfq: &HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> HipR
     } else {
         eprintln!("  loading output (tied embeddings)...");
         let embd_data = hfq.tensor_data("model.language_model.embed_tokens.weight").unwrap().1;
-        if embd_info.0.quant_type == 6 || embd_info.0.quant_type == 7 {
+        if embd_info.0.quant_type == 6 || embd_info.0.quant_type == 7 || embd_info.0.quant_type == 8 {
             let buf = gpu.upload_raw(embd_data, &[embd_data.len()])?;
-            let dtype = if embd_info.0.quant_type == 6 { DType::HFQ4G256 } else { DType::HFQ4G128 };
+            let dtype = match embd_info.0.quant_type {
+                6 => DType::HFQ4G256, 7 => DType::HFQ4G128, 8 => DType::HFQ6G256, _ => unreachable!()
+            };
             WeightTensor { buf, gpu_dtype: dtype, m: config.vocab_size, k: config.dim, row_stride: 0 }
         } else if embd_info.0.quant_type == 3 {
             let buf = gpu.upload_raw(embd_data, &[embd_data.len()])?;

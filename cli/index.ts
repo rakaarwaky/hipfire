@@ -76,9 +76,11 @@ class Engine {
 
 // ─── Commands ───────────────────────────────────────────
 
-async function run(model: string, prompt: string, temp = 0.3, maxTokens = 512) {
+async function run(model: string, prompt: string, image?: string, temp = 0.3, maxTokens = 512) {
   const path = findModel(model);
   if (!path) { console.error(`Model not found: ${model}\nRun: hipfire pull ${model}`); process.exit(1); }
+
+  if (image && !existsSync(image)) { console.error(`Image not found: ${image}`); process.exit(1); }
 
   const e = new Engine();
   await e.start();
@@ -86,12 +88,24 @@ async function run(model: string, prompt: string, temp = 0.3, maxTokens = 512) {
   await e.send({ type: "load", model: path });
   const loaded = await e.recv();
   if (loaded.type === "error") { console.error(loaded.message); process.exit(1); }
-  console.error(`[${loaded.arch}] ${loaded.dim}d ${loaded.layers}L ${loaded.vocab} vocab`);
+  const vlTag = loaded.vl ? " VL" : "";
+  console.error(`[${loaded.arch}${vlTag}] ${loaded.dim}d ${loaded.layers}L ${loaded.vocab} vocab`);
 
-  for await (const msg of e.generate({
+  if (image && !loaded.vl) {
+    console.error(`WARNING: --image passed but model does not have a vision encoder. Ignoring image.`);
+    image = undefined;
+  }
+
+  const genMsg: any = {
     type: "generate", id: "run", prompt,
     temperature: temp * TEMP_CORRECTION, max_tokens: maxTokens,
-  })) {
+  };
+  if (image) {
+    genMsg.image = resolve(image);
+    console.error(`[VL: ${image}]`);
+  }
+
+  for await (const msg of e.generate(genMsg)) {
     if (msg.type === "token") process.stdout.write(msg.text);
     else if (msg.type === "done") console.error(`\n[${msg.tokens} tok, ${msg.tok_s} tok/s]`);
   }
@@ -211,10 +225,8 @@ switch (cmd) {
     const imgIdx = rest.indexOf("--image");
     const image = imgIdx >= 0 ? rest[imgIdx + 1] : undefined;
     const filtered = rest.slice(1).filter((_, i) => i !== imgIdx - 1 && i !== imgIdx);
-    const prompt = filtered.join(" ") || "Hello";
-    // TODO: pass image to daemon when VL mode is wired into daemon protocol
-    if (image) console.error(`[VL mode: ${image}] (image support in daemon coming soon)`);
-    await run(model, prompt);
+    const prompt = filtered.join(" ") || (image ? "Describe this image." : "Hello");
+    await run(model, prompt, image);
     break;
   }
   case "list": for (const m of list()) console.log(`${m.name.padEnd(40)} ${m.size}`); break;
