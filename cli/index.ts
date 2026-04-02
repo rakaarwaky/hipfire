@@ -50,9 +50,9 @@ const REGISTRY: Record<string, ModelEntry> = {
   "qwen3.5:9b-hfq6":   { repo: hfRepo("qwen3.5","9b"),   file: "qwen3.5-9b.hfq6.hfq",   size_gb: 6.8,  min_vram_gb: 8,  desc: "37 tok/s, near-FP16" },
   "qwen3.5:27b-hfq6":  { repo: hfRepo("qwen3.5","27b"),  file: "qwen3.5-27b.hfq6.hfq",  size_gb: 21.4, min_vram_gb: 24, desc: "needs 24GB (7900 XTX)" },
 
-  // Qwen3 HFQ4
-  "qwen3:0.6b":    { repo: hfRepo("qwen3","0.6b"),   file: "qwen3-0.6b-hfq4.hfq",  size_gb: 0.4,  min_vram_gb: 1,  desc: "standard attention" },
-  "qwen3:8b":      { repo: hfRepo("qwen3","8b"),     file: "qwen3-8b.q4.hfq",       size_gb: 4.1,  min_vram_gb: 6,  desc: "59.9 tok/s, standard attention" },
+  // Qwen3 HFQ4 (original quantizer filenames — see docs/MODELS.md for naming notes)
+  "qwen3:0.6b":    { repo: hfRepo("qwen3","0.6b"),   file: "qwen3-0.6b-hfq4.hfq",    size_gb: 0.4,  min_vram_gb: 1,  desc: "standard attention" },
+  "qwen3:8b":      { repo: hfRepo("qwen3","8b"),     file: "qwen3-8b.q4.hfq",         size_gb: 4.1,  min_vram_gb: 6,  desc: "59.9 tok/s, standard attention" },
 };
 
 // Aliases
