@@ -62,15 +62,73 @@ fn main() {
         "Hello".to_string()
     };
 
-    eprintln!("=== hipfire Qwen3.5 inference ===");
+    eprintln!("=== hipfire inference ===");
     eprintln!("Model: {model_path}");
     if vl_mode { eprintln!("Image: {}", image_path.as_ref().unwrap()); }
     eprintln!("Prompt: {prompt_text}");
 
     // Load model config + tokenizer
     let hfq = HfqFile::open(Path::new(model_path)).expect("failed to parse HFQ");
+    let is_qwen35 = hfq.arch_id == 5;
+
+    // For Qwen3/LLaMA models, delegate to the infer_hfq path
+    if !is_qwen35 {
+        eprintln!("Architecture: Qwen3/LLaMA (arch_id={})", hfq.arch_id);
+        let config = engine::hfq::config_from_hfq(&hfq).expect("failed to read LLaMA config");
+        eprintln!("Config: dim={}, layers={}, heads={}, vocab={}", config.dim, config.n_layers, config.n_heads, config.vocab_size);
+        let tokenizer = engine::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+            .expect("tokenizer not found");
+        let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
+        eprintln!("Loading weights...");
+        let weights = engine::hfq::load_weights_hfq(&hfq, &config, &mut gpu).expect("failed to load weights");
+        let kv_seq = 2048usize;
+        let mut kv_cache = llama::KvCache::new_gpu_q8(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap();
+        let scratch = llama::ForwardScratch::new(&mut gpu, &config).unwrap();
+        let temp: f32 = 0.3;
+        let top_p: f32 = 0.8;
+        let mut rng_state = 42u32;
+        let prompt_tokens = tokenizer.encode(&prompt_text);
+        eprintln!("Prefilling {} tokens...", prompt_tokens.len());
+        let t0 = Instant::now();
+        for (pos, &tok) in prompt_tokens.iter().enumerate() {
+            let (_, rng) = llama::forward_scratch(&mut gpu, &weights, &config, tok, pos, &mut kv_cache, &scratch, temp, top_p, rng_state, 0, 1.0).unwrap();
+            rng_state = rng;
+        }
+        eprintln!("Prefill: {}ms", t0.elapsed().as_millis());
+        let mut out_bytes = [0u8; 8];
+        gpu.hip.memcpy_dtoh(&mut out_bytes, &scratch.sample_buf.buf).unwrap();
+        let mut next_token = u32::from_ne_bytes([out_bytes[0], out_bytes[1], out_bytes[2], out_bytes[3]]);
+        rng_state = u32::from_ne_bytes([out_bytes[4], out_bytes[5], out_bytes[6], out_bytes[7]]);
+        let max_gen = 256usize;
+        let t1 = Instant::now();
+        let mut token_history: Vec<u32> = prompt_tokens.clone();
+        let mut generated = Vec::new();
+        for _ in 0..max_gen {
+            generated.push(next_token);
+            token_history.push(next_token);
+            let text = tokenizer.decode(&[next_token]);
+            print!("{text}");
+            std::io::stdout().flush().ok();
+            if next_token == config.eos_token || !RUNNING.load(Ordering::Relaxed) { break; }
+            let hist_start = token_history.len().saturating_sub(64);
+            let hist_slice = &token_history[hist_start..];
+            let hist_bytes: Vec<u8> = hist_slice.iter().flat_map(|t| t.to_ne_bytes()).collect();
+            gpu.hip.memcpy_htod(&scratch.repeat_buf.buf, &hist_bytes).unwrap();
+            let pos = prompt_tokens.len() + generated.len() - 1;
+            let (tok, rng) = llama::forward_scratch(&mut gpu, &weights, &config, next_token, pos, &mut kv_cache, &scratch, temp, top_p, rng_state, hist_slice.len(), 1.3).unwrap();
+            next_token = tok;
+            rng_state = rng;
+        }
+        let gen_ms = t1.elapsed().as_millis();
+        let tok_s = if gen_ms > 0 { generated.len() as f64 / (gen_ms as f64 / 1000.0) } else { 0.0 };
+        eprintln!("\n\n=== Done: {} tokens in {}ms ({:.1} tok/s) ===", generated.len(), gen_ms, tok_s);
+        return;
+    }
+
+    // Qwen3.5 DeltaNet path
+    eprintln!("Architecture: Qwen3.5 DeltaNet (arch_id=5)");
     let text_config = qwen35::config_from_hfq(&hfq).expect("failed to read Qwen3.5 config");
-    eprintln!("Text: dim={}, layers={}, vocab={}", text_config.dim, text_config.n_layers, text_config.vocab_size);
+    eprintln!("Config: dim={}, layers={}, heads={}, vocab={}", text_config.dim, text_config.n_layers, text_config.n_heads, text_config.vocab_size);
 
     let tokenizer = engine::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .expect("tokenizer not found in HFQ metadata");
