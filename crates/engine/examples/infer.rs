@@ -138,13 +138,20 @@ fn main() {
     prompt_tokens.extend_from_slice(&tokenizer.encode("assistant"));
     prompt_tokens.extend_from_slice(&nl);
 
+    // Include <think>\n in prompt tokens (must be prefilled together, not separate)
+    let mut in_thinking = false;
+    if !no_think {
+        prompt_tokens.extend_from_slice(&tokenizer.encode("<think>"));
+        prompt_tokens.extend_from_slice(&nl);
+        in_thinking = true;
+    }
+
     eprintln!("Prompt: {} tokens{}", prompt_tokens.len(),
         if vl_mode { format!(" ({} visual + {} text)", n_visual_tokens, prompt_tokens.len() - n_visual_tokens) } else { String::new() });
 
-    let sc = llama::SamplingConfig::vl_thinking();
+    let sc = llama::SamplingConfig::text_thinking();
 
-    // Prefill using forward() path (correct numerics, alloc/free per token)
-    // TODO: debug forward_scratch() numerical divergence that causes 9B thinking degeneration
+    // Prefill
     let t_pf = Instant::now();
     let mut logits = vec![0.0f32; text_config.vocab_size];
     let mut visual_idx = 0usize;
@@ -160,32 +167,17 @@ fn main() {
                 .expect("forward failed");
         }
     }
+    let prefill_len = prompt_tokens.len();
     let prefill_ms = t_pf.elapsed().as_millis();
     eprintln!("Prefill: {}ms ({:.0} tok/s)", prefill_ms,
         prompt_tokens.len() as f64 / (prefill_ms as f64 / 1000.0));
+    if in_thinking { eprint!("<think>"); }
 
     // Thinking mode
     let im_end_token = if im_end.len() == 1 { Some(im_end[0]) } else { None };
     let think_end_seq = tokenizer.encode("</think>");
-    let think_start_seq = tokenizer.encode("<think>");
     let max_gen = 2048;
     let max_think = 512;
-
-    let prefill_len;
-    let mut in_thinking;
-    if !no_think {
-        let think_tokens = tokenizer.encode("<think>\n");
-        for (i, &t) in think_tokens.iter().enumerate() {
-            logits = qwen35::forward(&mut gpu, &weights, &text_config, t, prompt_tokens.len() + i, &mut kv_cache, &mut dn_state)
-                .expect("forward failed");
-        }
-        prefill_len = prompt_tokens.len() + think_tokens.len();
-        in_thinking = true;
-        eprint!("<think>");
-    } else {
-        prefill_len = prompt_tokens.len();
-        in_thinking = false;
-    }
 
     // First token
     let temp = if in_thinking { sc.think_temp } else { sc.answer_temp };
