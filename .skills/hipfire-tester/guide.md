@@ -11,7 +11,8 @@ via a Rust-native HIP path — no Python in the hot path.
 | RX 5700 XT | gfx1010 | 8GB | Primary dev target |
 | RX 6800 XT | gfx1030 | 16GB | Alpha target |
 | RX 7900 XTX | gfx1100 | 24GB | Alpha target |
-| RX 9070 | gfx1200 | 16GB | Alpha target |
+| RX 9060 | gfx1200 | 16GB | Alpha target |
+| RX 9070 XT | gfx1201 | 16GB | Alpha target, RDNA4-optimized kernels |
 
 ## Quantizing Models
 
@@ -93,12 +94,14 @@ target/release/examples/infer models/qwen3.5-9b.q4.hfq --turbo2 "Your prompt"
 target/release/examples/infer models/qwen3.5-4b.q4.hfq --image photo.png "Describe this"
 ```
 
-### Via the CLI
+### Via the CLI (ollama-style)
 
 ```bash
-hipfire run qwen3.5-9b.q4.hfq "Your prompt"
+hipfire pull qwen3.5:9b         # Download model
+hipfire run qwen3.5:9b "Hello"  # Run (auto-pulls if needed)
 hipfire serve                   # OpenAI-compatible API on port 11435
-hipfire run qwen3.5-4b.q4.hfq --image img.png "Describe this"
+hipfire run qwen3.5:4b --image img.png "Describe this"
+hipfire list -r                 # Show local + available models
 ```
 
 ### KV mode summary
@@ -175,7 +178,7 @@ This requires the ROCm SDK (hipcc).
 # Compile for a new arch
 scripts/compile-kernels.sh gfxNNNN
 
-# Verify — should print 102 (or close to it)
+# Verify — should print 102+ kernels
 ls kernels/compiled/gfxNNNN/*.hsaco | wc -l
 ```
 
