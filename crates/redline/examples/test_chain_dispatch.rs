@@ -122,6 +122,10 @@ __global__ void vector_add(const float* a, const float* b, float* c, int n) {
         ka_data[hidden2+14..hidden2+16].copy_from_slice(&1u16.to_le_bytes());
         ka_data[hidden2+16..hidden2+18].copy_from_slice(&1u16.to_le_bytes());
 
+        // Fence buffer for barrier
+        let fence_buf = dev.alloc_vram(4096).unwrap();
+        dev.upload(&fence_buf, &vec![0u8; 64]).unwrap();
+
         // Upload both kernargs in one shot
         dev.upload(dq.kernarg_buf(), &ka_data).unwrap();
         let ka_base = dq.kernarg_buf().gpu_addr;
@@ -129,12 +133,12 @@ __global__ void vector_add(const float* a, const float* b, float* c, int n) {
         // Build command buffer with barrier between dispatches
         let mut cb = CommandBuffer::new();
         cb.dispatch(kernel, [groups, 1, 1], [256, 1, 1], ka_base + ka1_off);
-        cb.barrier();
+        cb.barrier(fence_buf.gpu_addr, 1);
         cb.dispatch(kernel, [groups, 1, 1], [256, 1, 1], ka_base + ka2_off);
 
         // One submit, one fence
         dq.submit(&dev, &cb,
-            &[dq.kernarg_buf(), &module.code_buf, &a_buf, &b_buf, &c_buf, &d_buf]).unwrap();
+            &[dq.kernarg_buf(), &module.code_buf, &a_buf, &b_buf, &c_buf, &d_buf, &fence_buf]).unwrap();
     }
     let chain_time = t0.elapsed();
 
