@@ -64,8 +64,8 @@ Compress the KV cache with FWHT + quantization for longer context in less VRAM:
 - **Vision-Language (VL)**: GPU vision encoder, `hipfire run model --image img.png "Describe this"`
 - **TurboQuant KV**: Symmetric turbo4/turbo2 with 256-dim FWHT, up to 15.5x compression
 - **Thinking mode**: `<think>` reasoning with n-gram loop prevention
-- **Pre-compiled kernels**: Ship .hsaco blobs with hash validation, no ROCm SDK needed at runtime
-- **Kernel integrity**: Source-hash sidecar files detect stale blobs, auto-recompile via hipcc if available
+- **Pre-compiled kernels**: Ship .hsaco blobs, no ROCm SDK needed at runtime
+- **Kernel integrity**: Source-hash sidecar files detect stale blobs when hipcc is available (see [#2](https://github.com/Kaden-Schutt/hipfire/issues/2))
 - **4 GPU arches**: gfx1010 (5700 XT), gfx1030 (6800 XT), gfx1100 (7900 XTX), gfx1200 (9070)
 - **Zero VRAM leak**: Explicit GPU free + pool drain for model eviction
 - **OpenAI-compatible API**: `hipfire serve` → `/v1/chat/completions` with SSE streaming
