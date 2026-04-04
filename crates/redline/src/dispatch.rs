@@ -176,6 +176,81 @@ impl CommandBuffer {
         d.push(di);
     }
 
+    /// Append a dispatch with explicit dynamic LDS (shared memory) size.
+    /// `lds_bytes` is the dynamic shared memory in bytes (added to kernel's static LDS).
+    pub fn dispatch_with_lds(&mut self, k: &Kernel, grid: [u32; 3], block: [u32; 3],
+                              kernarg_va: u64, lds_bytes: u32) {
+        let d = &mut self.dwords;
+
+        // COMPUTE_PGM_LO/HI
+        d.push(pkt3(SET_SH_REG, 3));
+        d.push(0x020C);
+        d.push((k.code_va >> 8) as u32);
+        d.push((k.code_va >> 40) as u32);
+
+        // COMPUTE_PGM_RSRC1
+        d.push(pkt3(SET_SH_REG, 2));
+        d.push(0x0212);
+        d.push(k.pgm_rsrc1);
+
+        // COMPUTE_PGM_RSRC2 with LDS_SIZE override
+        // LDS_SIZE field is bits [20:14] — number of 512-byte blocks
+        // Total LDS = kernel static + dynamic lds_bytes
+        let total_lds = k.group_segment_size + lds_bytes;
+        let lds_blocks = (total_lds + 511) / 512; // round up to 512-byte blocks
+        let rsrc2_base = k.pgm_rsrc2 & !(0x7F << 14); // clear existing LDS_SIZE
+        let rsrc2 = rsrc2_base | ((lds_blocks & 0x7F) << 14);
+
+        d.push(pkt3(SET_SH_REG, 2));
+        d.push(0x0213); // COMPUTE_PGM_RSRC2 offset (0x0212 + 1)
+        d.push(rsrc2);
+
+        // PGM_RSRC3
+        d.push(pkt3(SET_SH_REG, 2));
+        d.push(0x0228);
+        d.push(0);
+
+        // TMPRING_SIZE
+        d.push(pkt3(SET_SH_REG, 2));
+        d.push(0x0218);
+        d.push(0);
+
+        // NUM_THREAD
+        d.push(pkt3(SET_SH_REG, 4));
+        d.push(0x0207);
+        d.push(block[0]);
+        d.push(block[1]);
+        d.push(block[2]);
+
+        // RESOURCE_LIMITS
+        d.push(pkt3(SET_SH_REG, 2));
+        d.push(0x0215);
+        d.push(0);
+
+        // USER_DATA
+        if k.user_sgpr_count > 0 {
+            d.push(pkt3(SET_SH_REG, 1 + k.user_sgpr_count));
+            d.push(0x0240);
+            for i in 0..k.user_sgpr_count {
+                if Some(i) == k.kernarg_sgpr_idx {
+                    d.push(kernarg_va as u32);
+                } else if Some(i) == k.kernarg_sgpr_idx.map(|x| x + 1) {
+                    d.push((kernarg_va >> 32) as u32);
+                } else {
+                    d.push(0);
+                }
+            }
+        }
+
+        // DISPATCH_DIRECT
+        let di = (1u32 << 0) | (1 << 15); // CS_EN | CS_W32_EN
+        d.push(pkt3(DISPATCH_DIRECT, 4));
+        d.push(grid[0]);
+        d.push(grid[1]);
+        d.push(grid[2]);
+        d.push(di);
+    }
+
     /// Insert a barrier between dispatches — waits for previous compute to finish.
     /// Uses CS_PARTIAL_FLUSH event. On same-context dispatch, L2 coherency is
     /// maintained by the hardware for write→read dependencies.
