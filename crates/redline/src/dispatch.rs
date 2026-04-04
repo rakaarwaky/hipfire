@@ -251,14 +251,16 @@ impl CommandBuffer {
         d.push(di);
     }
 
-    /// Insert a barrier between dispatches — waits for previous compute to finish.
-    /// Uses CS_PARTIAL_FLUSH event. On same-context dispatch, L2 coherency is
-    /// maintained by the hardware for write→read dependencies.
-    pub fn barrier(&mut self) {
+    /// Insert a compute barrier: RELEASE_MEM (fence write + L2 flush) + WAIT_REG_MEM (poll).
+    /// `fence_va`: GPU VA of a dword-aligned fence location.
+    /// `fence_value`: value RELEASE_MEM writes; WAIT_REG_MEM polls for it.
+    pub fn barrier(&mut self, _fence_va: u64, _fence_value: u32) {
         let d = &mut self.dwords;
-        // CS_PARTIAL_FLUSH: wait for all outstanding compute shaders on this context
+        // CS_PARTIAL_FLUSH only. On gfx1010, RELEASE_MEM and ACQUIRE_MEM both
+        // cause GPU resets in application IBs (privileged packets).
+        // CS_PARTIAL_FLUSH tells MEC to drain outstanding dispatches.
         d.push(pkt3(0x46, 1));
-        d.push(7); // EVENT_TYPE=CS_PARTIAL_FLUSH
+        d.push(7); // EVENT_TYPE=CS_PARTIAL_FLUSH(7)
     }
 
     /// Number of PM4 dwords in this command buffer.
@@ -478,6 +480,20 @@ impl FastDispatch {
         }
 
         // Submit with persistent BO list — only the ioctl remains
+        self.queue.submit_with_bo_list(dev, &self.ib_buf, cb.len_dwords(), self.bo_list_handle)
+    }
+
+    /// Get a reference to the persistent kernarg buffer.
+    pub fn ka_buf_ref(&self) -> &GpuBuffer {
+        &self.ka_buf
+    }
+
+    /// Submit a pre-built command buffer using the persistent BO list.
+    pub fn submit_cmdbuf(&self, dev: &Device, cb: &CommandBuffer) -> Result<()> {
+        let ib_bytes = cb.as_bytes();
+        unsafe {
+            std::ptr::copy_nonoverlapping(ib_bytes.as_ptr(), self.ib_ptr, ib_bytes.len());
+        }
         self.queue.submit_with_bo_list(dev, &self.ib_buf, cb.len_dwords(), self.bo_list_handle)
     }
 
