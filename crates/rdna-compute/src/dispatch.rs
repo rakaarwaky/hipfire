@@ -2983,6 +2983,7 @@ impl Gpu {
         let mut nk = n_kv_heads as i32;
         let mut hd = head_dim as i32;
         let mut ms = max_seq as i32;
+        let mut scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut params: Vec<*mut c_void> = vec![
             &mut qp as *mut _ as *mut c_void, &mut kp as *mut _ as *mut c_void,
             &mut vp as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void,
@@ -2990,12 +2991,11 @@ impl Gpu {
             &mut s2 as *mut _ as *mut c_void, &mut sl as *mut _ as *mut c_void,
             &mut nh as *mut _ as *mut c_void, &mut nk as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void, &mut ms as *mut _ as *mut c_void,
+            &mut scale as *mut _ as *mut c_void,
         ];
-        // Kernel uses exactly 32 threads: 32 × 8 dims = 256 head_dim.
-        // Shared memory: scores[seq_len] + workspace[32].
-        let block_size = 32u32;
-        let shared = ((seq_len + 32) * 4) as u32;
-        unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [block_size, 1, 1], shared, self.stream_ref(), &mut params) }
+        // 32 threads (warp-cooperative), shared memory: scores[seq_len] only
+        let shared = (seq_len * 4) as u32;
+        unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [32, 1, 1], shared, self.stream_ref(), &mut params) }
     }
 
     // ═══ Symmetric turbo for head_dim=256 ═══
