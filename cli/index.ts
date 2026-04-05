@@ -452,14 +452,14 @@ switch (cmd) {
     // Rebuild
     console.error("Rebuilding...");
     const build = Bun.spawnSync(
-      ["cargo", "build", "--release", "--features", "deltanet", "--example", "daemon", "--example", "infer", "-p", "engine"],
+      ["cargo", "build", "--release", "--features", "deltanet", "--example", "daemon", "--example", "infer", "--example", "run", "-p", "engine"],
       { cwd: repoDir, stdio: ["inherit", "inherit", "inherit"] }
     );
     if (build.exitCode !== 0) { console.error("Build failed."); process.exit(1); }
     // Recopy binaries
     const binDir = join(HIPFIRE_DIR, "bin");
     const { copyFileSync } = await import("fs");
-    for (const bin of ["daemon", "infer"]) {
+    for (const bin of ["daemon", "infer", "run"]) {
       const src = join(repoDir, "target/release/examples", bin);
       if (existsSync(src)) { copyFileSync(src, join(binDir, bin)); }
     }
