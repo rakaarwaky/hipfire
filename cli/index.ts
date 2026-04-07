@@ -647,12 +647,25 @@ function findModel(name: string): string | null {
     }
   }
 
-  // Fuzzy search local dirs
+  // Fuzzy search local dirs (top-level + one level of subdirectories)
+  const searchName = name.replace(":", "-");
+  const isModel = (f: string) => (f.endsWith(".hf4") || f.endsWith(".hf6") || f.endsWith(".hfq")) && (f.includes(name) || f.includes(searchName));
   const dirs = [resolve(__dirname, "../models"), MODELS_DIR];
   for (const dir of dirs) {
-    try { for (const f of readdirSync(dir)) {
-      if ((f.endsWith(".hf4") || f.endsWith(".hf6") || f.endsWith(".hfq")) && (f.includes(name) || f.includes(name.replace(":", "-")))) return join(dir, f);
-    }} catch {}
+    try {
+      for (const f of readdirSync(dir)) {
+        const full = join(dir, f);
+        if (isModel(f)) return full;
+        // Check one level of subdirectories (e.g., models/community/)
+        try {
+          if (statSync(full).isDirectory()) {
+            for (const sf of readdirSync(full)) {
+              if (isModel(sf)) return join(full, sf);
+            }
+          }
+        } catch {}
+      }
+    } catch {}
   }
   return null;
 }
