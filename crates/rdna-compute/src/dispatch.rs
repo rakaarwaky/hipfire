@@ -380,9 +380,13 @@ impl Gpu {
             &mut d as *mut _ as *mut c_void,
         ];
 
-        unsafe {
+        let bytes = crate::profile::embedding_hfq4g256_bytes(dim);
+        let timer = crate::profile::begin_timer(&self.hip, "embedding", "embedding_lookup_hfq4g256", bytes);
+        let result = unsafe {
             self.hip.launch_kernel(func, [1, 1, 1], [256, 1, 1], 0, self.stream_ref(), &mut params)
-        }
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
     }
 
     /// HFQ4-G128 embedding lookup: dequantize one row on GPU, output F32.
@@ -676,7 +680,11 @@ impl Gpu {
             &mut s1 as *mut _ as *mut c_void, &mut s2 as *mut _ as *mut c_void,
             &mut kv as *mut _ as *mut c_void,
         ];
-        unsafe { self.hip.launch_kernel(rot_func, [n_groups, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+        let bytes = crate::profile::mq_rotate_bytes(k);
+        let timer = crate::profile::begin_timer(&self.hip, "fwht", "mq_rotate_x", bytes);
+        let result = unsafe { self.hip.launch_kernel(rot_func, [n_groups, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
     }
 
     /// MagnumQuant MQ4: rotate x once, then GEMV against rotated x.
@@ -887,7 +895,9 @@ impl Gpu {
         // and Infinity Cache makes launch overhead negligible vs compute.
         // Other archs: use wide kernel (2 rows/block) for large M.
         let use_wide = m >= 64 && !matches!(self.arch.as_str(), "gfx1030" | "gfx1031" | "gfx1100" | "gfx1101" | "gfx1102");
-        if use_wide {
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_hfq4g256", bytes);
+        let result = if use_wide {
             self.ensure_kernel("gemv_hfq4g256_wide", kernels::GEMV_HFQ4G256_WIDE_SRC, "gemv_hfq4g256_wide")?;
             let wfunc = &self.functions["gemv_hfq4g256_wide"];
             let grid = ((m + 1) / 2) as u32;
@@ -898,7 +908,9 @@ impl Gpu {
             unsafe {
                 self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params)
             }
-        }
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
     }
 
     // HFQ2 GEMV dispatch already exists at line ~521 from the HFQ family
@@ -934,7 +946,9 @@ impl Gpu {
         ];
 
         let batch_tiles = ((batch_size + 7) / 8) as u32; // ceil(batch_size / BATCH_TILE=8)
-        unsafe {
+        let bytes = crate::profile::gemm_hfq4g256_bytes(m, k, batch_size);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemm_hfq4g256", bytes);
+        let result = unsafe {
             self.hip.launch_kernel(
                 func,
                 [m as u32, batch_tiles, 1],
@@ -943,7 +957,9 @@ impl Gpu {
                 self.stream_ref(),
                 &mut params,
             )
-        }
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
     }
 
     /// Compute max softmax probability on GPU. Downloads 4 bytes instead of vocab×4.
@@ -1367,7 +1383,9 @@ impl Gpu {
         let block_size = 256u32.min(n as u32);
         let shared_mem = block_size * 4; // float per thread
 
-        unsafe {
+        let bytes = crate::profile::rmsnorm_bytes(batch * n as usize);
+        let timer = crate::profile::begin_timer(&self.hip, "rmsnorm", "rmsnorm_f32", bytes);
+        let result = unsafe {
             self.hip.launch_kernel(
                 func,
                 [batch as u32, 1, 1],
@@ -1376,7 +1394,9 @@ impl Gpu {
                 self.stream_ref(),
                 &mut params,
             )
-        }
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
     }
 
     /// Batched RMSNorm: normalize `batch` vectors of length `n` independently.
@@ -1405,9 +1425,13 @@ impl Gpu {
 
         let block_size = 256u32.min(n as u32);
         let shared_mem = block_size * 4;
-        unsafe {
+        let bytes = crate::profile::rmsnorm_bytes(batch * n);
+        let timer = crate::profile::begin_timer(&self.hip, "rmsnorm", "rmsnorm_batched", bytes);
+        let result = unsafe {
             self.hip.launch_kernel(func, [batch as u32, 1, 1], [block_size, 1, 1], shared_mem, None, &mut params)
-        }
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
     }
 
     /// c = a + b (element-wise)
@@ -1451,7 +1475,11 @@ impl Gpu {
 
         let block = 256u32;
         let grid = ((n as u32) + block - 1) / block;
-        unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, None, &mut params) }
+        let bytes = crate::profile::elementwise_bytes(n as usize);
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", "add_inplace_f32", bytes);
+        let result = unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, None, &mut params) };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
     }
 
     /// c = a * b (element-wise)
@@ -1474,7 +1502,11 @@ impl Gpu {
 
         let block = 256u32;
         let grid = ((n as u32) + block - 1) / block;
-        unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, None, &mut params) }
+        let bytes = crate::profile::elementwise_bytes(n as usize);
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", "mul_f32", bytes);
+        let result = unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, None, &mut params) };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
     }
 
     /// out = silu(x)
@@ -1518,7 +1550,11 @@ impl Gpu {
 
         let block = 256u32;
         let grid = ((n as u32) + block - 1) / block;
-        unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, None, &mut params) }
+        let bytes = crate::profile::elementwise_bytes(n as usize);
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", "silu_mul_f32", bytes);
+        let result = unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, None, &mut params) };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
     }
 
     /// In-place softmax over last dimension
@@ -2156,7 +2192,11 @@ impl Gpu {
             &mut hd as *mut _ as *mut c_void,
         ];
         let total_blocks = (n_kv_heads * head_dim / 32) as u32;
-        unsafe { self.hip.launch_kernel(func, [total_blocks, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+        let bytes = crate::profile::kv_cache_write_q8_0_bytes(n_kv_heads, head_dim);
+        let timer = crate::profile::begin_timer(&self.hip, "kv_write", "kv_cache_write_q8_0", bytes);
+        let result = unsafe { self.hip.launch_kernel(func, [total_blocks, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
     }
 
     /// Attention with Q8_0 quantized KV cache.
@@ -2183,7 +2223,11 @@ impl Gpu {
         let block_size = (seq_len_hint.max(head_dim) as u32).next_power_of_two().min(256);
         // Extra shared mem for Q head vector preloaded into shared memory
         let shared_mem = ((seq_len_hint + block_size as usize + head_dim) * 4) as u32;
-        unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [block_size, 1, 1], shared_mem, self.stream_ref(), &mut params) }
+        let bytes = crate::profile::attention_q8_0_kv_bytes(n_heads, n_kv_heads, head_dim, seq_len_hint);
+        let timer = crate::profile::begin_timer(&self.hip, "attention", "attention_q8_0_kv", bytes);
+        let result = unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [block_size, 1, 1], shared_mem, self.stream_ref(), &mut params) };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
     }
 
     /// Write KV vector to Q8 (int8 symmetric) quantized cache.
@@ -2460,7 +2504,11 @@ impl Gpu {
         let n_pairs = (n_rot / 2) as u32;
         let block = 32u32.min(n_pairs);
         let grid = (n_pairs + block - 1) / block;
-        unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params) }
+        let bytes = crate::profile::rope_bytes(n_heads_q, n_heads_k, head_dim);
+        let timer = crate::profile::begin_timer(&self.hip, "rope", "rope_partial_interleaved_f32", bytes);
+        let result = unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params) };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
     }
 
     /// Sigmoid activation, in-place.
@@ -2486,7 +2534,11 @@ impl Gpu {
         let total = (n_heads * head_dim) as u32;
         let block = 256u32;
         let grid = (total + block - 1) / block;
-        unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params) }
+        let bytes = n_heads * head_dim * 4 * 3; // read interleaved, write both outputs
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", "deinterleave_f32", bytes);
+        let result = unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params) };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
     }
 
     #[cfg(feature = "deltanet")]
@@ -2500,7 +2552,11 @@ impl Gpu {
         ];
         let block = 256u32;
         let grid = ((n as u32) + block - 1) / block;
-        unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params) }
+        let bytes = crate::profile::elementwise1_bytes(n as usize);
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", "sigmoid_f32", bytes);
+        let result = unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params) };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
     }
 
     /// Softplus activation, in-place.
@@ -2531,7 +2587,11 @@ impl Gpu {
             &mut xp as *mut _ as *mut c_void, &mut nh as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void, &mut ep as *mut _ as *mut c_void,
         ];
-        unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+        let bytes = crate::profile::elementwise1_bytes(n_heads * head_dim);
+        let timer = crate::profile::begin_timer(&self.hip, "rmsnorm", "l2_norm_f32", bytes);
+        let result = unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
     }
 
     /// 1D causal conv (kernel_size=4) for decode. Updates ring buffer state.
@@ -2578,7 +2638,11 @@ impl Gpu {
             &mut nh as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
             &mut ep as *mut _ as *mut c_void,
         ];
-        unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+        let bytes = crate::profile::gated_norm_bytes(n_heads * head_dim);
+        let timer = crate::profile::begin_timer(&self.hip, "rmsnorm", "gated_norm_f32", bytes);
+        let result = unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
     }
 
     /// Gated Delta Net recurrence. S matrix in LDS. Processes all tokens sequentially.
@@ -2643,7 +2707,11 @@ impl Gpu {
             &mut hd as *mut _ as *mut c_void,
         ];
         let n_tiles = (128 / 4) as u32;
-        unsafe { self.hip.launch_kernel(func, [n_heads as u32, n_tiles, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+        let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
+        let timer = crate::profile::begin_timer(&self.hip, "deltanet", "gated_delta_net_q8", bytes);
+        let result = unsafe { self.hip.launch_kernel(func, [n_heads as u32, n_tiles, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
     }
 
     /// GDN recurrence with Q4-quantized S state.
@@ -2696,7 +2764,11 @@ impl Gpu {
         ];
         let block = 256u32;
         let grid = ((n as u32) + block - 1) / block;
-        unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params) }
+        let bytes = n * 4 * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", "alpha_gate_f32", bytes);
+        let result = unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params) };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
     }
 
     /// Scale vector by constant: x[i] *= scale. Replaces 48µs CPU roundtrip.
@@ -2714,7 +2786,11 @@ impl Gpu {
         ];
         let block = 256u32;
         let grid = ((n as u32) + block - 1) / block;
-        unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params) }
+        let bytes = crate::profile::elementwise1_bytes(n);
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", "scale_f32", bytes);
+        let result = unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params) };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
     }
 
     /// Fused conv1d (kernel_size=4) + SiLU decode.
@@ -2737,7 +2813,11 @@ impl Gpu {
         ];
         let block = 256u32;
         let grid = ((n_channels as u32) + block - 1) / block;
-        unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params) }
+        let bytes = crate::profile::conv1d_silu_bytes(n_channels);
+        let timer = crate::profile::begin_timer(&self.hip, "deltanet", "conv1d_silu_f32", bytes);
+        let result = unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params) };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
     }
 
     // ═══════════════════════════════════════════════════════════════════════════

@@ -4,6 +4,7 @@ mod compiler;
 mod dispatch;
 mod kernels;
 pub mod pool;
+pub mod profile;
 pub mod profiler;
 
 pub use compiler::KernelCompiler;
