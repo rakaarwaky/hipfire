@@ -380,6 +380,12 @@ pub const SOFTPLUS_SRC: &str = include_str!("../../../kernels/src/softplus.hip")
 #[cfg(feature = "deltanet")]
 pub const L2_NORM_SRC: &str = include_str!("../../../kernels/src/l2_norm.hip");
 
+/// Fused L2-norm(Q) + L2-norm(K) + scale(Q). Replaces three back-to-back
+/// launches in the DeltaNet attention path with one. See kernel header for
+/// details.
+#[cfg(feature = "deltanet")]
+pub const FUSED_QK_L2_NORM_SCALE_SRC: &str = include_str!("../../../kernels/src/fused_qk_l2_norm_scale.hip");
+
 
 /// Partial interleaved RoPE: rotate only first n_rot dims, pairs are adjacent (d0,d1),(d2,d3),...
 /// Dims >= n_rot pass through unchanged.

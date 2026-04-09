@@ -772,12 +772,15 @@ fn forward_from_x_gpu(
                 gpu.hip.memcpy_dtod_at(&k_part.buf, 0, &conv_out.buf, k_dim * 4, k_dim * 4)?;
                 gpu.hip.memcpy_dtod_at(&v_part.buf, 0, &conv_out.buf, k_dim * 2 * 4, v_dim * 4)?;
 
-                // L2 normalize Q and K
-                gpu.l2_norm_f32(&q_part, config.linear_num_key_heads, config.linear_key_head_dim, config.norm_eps)?;
-                gpu.l2_norm_f32(&k_part, config.linear_num_key_heads, config.linear_key_head_dim, config.norm_eps)?;
-
-                // Scale Q by 1/sqrt(S_k) before recurrence (all on GPU)
-                gpu.scale_f32(&q_part, 1.0 / (config.linear_key_head_dim as f32).sqrt())?;
+                // Fused L2-norm(Q) + L2-norm(K) + scale(Q) — 3 launches → 1.
+                gpu.fused_qk_l2_norm_scale_f32(
+                    &q_part,
+                    &k_part,
+                    config.linear_num_key_heads,
+                    config.linear_key_head_dim,
+                    1.0 / (config.linear_key_head_dim as f32).sqrt(),
+                    config.norm_eps,
+                )?;
 
                 // Repeat Q/K heads if num_k_heads < num_v_heads (GQA-style)
                 // Phase 3a-A fix: same fused kernel as forward_scratch_layers.
@@ -1205,9 +1208,17 @@ fn forward_scratch_layers(
                 gpu.hip.memcpy_dtod_at(&s.dn_k_raw.buf, 0, &s.dn_conv_out.buf, k_dim * 4, k_dim * 4)?;
                 gpu.hip.memcpy_dtod_at(&s.dn_v.buf, 0, &s.dn_conv_out.buf, k_dim * 2 * 4, v_dim * 4)?;
 
-                gpu.l2_norm_f32(&s.dn_q_raw, config.linear_num_key_heads, hd, config.norm_eps)?;
-                gpu.l2_norm_f32(&s.dn_k_raw, config.linear_num_key_heads, hd, config.norm_eps)?;
-                gpu.scale_f32(&s.dn_q_raw, 1.0 / (hd as f32).sqrt())?;
+                // Fused: l2_norm(q_raw) + l2_norm(k_raw) + scale(q_raw).
+                // Three launches collapsed to one — saves ~2 dispatches per
+                // linear-attention layer (~300 µs/forward on 0.8B MQ4).
+                gpu.fused_qk_l2_norm_scale_f32(
+                    &s.dn_q_raw,
+                    &s.dn_k_raw,
+                    config.linear_num_key_heads,
+                    hd,
+                    1.0 / (hd as f32).sqrt(),
+                    config.norm_eps,
+                )?;
 
                 // Repeat-interleave Q/K if needed.
                 // Phase 3a-A fix: replace per-head memcpy loop with one fused kernel.

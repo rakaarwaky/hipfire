@@ -2860,6 +2860,50 @@ impl Gpu {
         result
     }
 
+    /// Fused L2-norm(Q) + L2-norm(K) + scale(Q). Replaces three back-to-back
+    /// launches in DeltaNet's attention path with one — ~2 launches saved per
+    /// linear-attention layer, so on Qwen3.5 (18-32 LA layers) we shave ~36-64
+    /// launches per forward.
+    #[cfg(feature = "deltanet")]
+    pub fn fused_qk_l2_norm_scale_f32(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        n_heads: usize,
+        head_dim: usize,
+        q_scale: f32,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "fused_qk_l2_norm_scale",
+            kernels::FUSED_QK_L2_NORM_SCALE_SRC,
+            "fused_qk_l2_norm_scale_f32",
+        )?;
+        let func = &self.functions["fused_qk_l2_norm_scale_f32"];
+        let mut qp = q.buf.as_ptr();
+        let mut kp = k.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut qs = q_scale;
+        let mut ep = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut qs as *mut _ as *mut c_void,
+            &mut ep as *mut _ as *mut c_void,
+        ];
+        // Covers both Q and K reads/writes.
+        let bytes = crate::profile::elementwise1_bytes(n_heads * head_dim) * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "fused", "fused_qk_l2_norm_scale_f32", bytes);
+        let result = unsafe {
+            self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params)
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// 1D causal conv (kernel_size=4) for decode. Updates ring buffer state.
     #[cfg(feature = "deltanet")]
     pub fn conv1d_decode_f32(
@@ -3750,6 +3794,7 @@ impl Gpu {
             ("alpha_gate",               kernels::ALPHA_GATE_SRC.to_string()),
             ("conv1d_silu",              kernels::CONV1D_SILU_SRC.to_string()),
             ("l2_norm",                  kernels::L2_NORM_SRC.to_string()),
+            ("fused_qk_l2_norm_scale",   kernels::FUSED_QK_L2_NORM_SCALE_SRC.to_string()),
             ("scale_f32",                kernels::SCALE_F32_SRC.to_string()),
             ("gated_norm",               kernels::GATED_NORM_SRC.to_string()),
             ("rope_partial_interleaved", kernels::ROPE_PARTIAL_INTERLEAVED_SRC.to_string()),
@@ -3842,6 +3887,7 @@ impl Gpu {
                 "alpha_gate" => vec!["alpha_gate_f32"],
                 "conv1d_silu" => vec!["conv1d_silu_f32"],
                 "l2_norm" => vec!["l2_norm_f32"],
+                "fused_qk_l2_norm_scale" => vec!["fused_qk_l2_norm_scale_f32"],
                 "scale_f32" => vec!["scale_f32"],
                 "gated_norm" => vec!["gated_norm_f32"],
                 "rope_partial_interleaved" => vec!["rope_partial_interleaved_f32"],
