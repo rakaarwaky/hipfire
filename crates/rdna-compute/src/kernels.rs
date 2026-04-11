@@ -352,6 +352,10 @@ pub const KV_CACHE_WRITE_Q8_0_SRC: &str = include_str!("../../../kernels/src/kv_
 /// K and V caches stored as [max_seq × n_kv_heads × blocks_per_head × 34].
 pub const ATTENTION_Q8_0_KV_SRC: &str = include_str!("../../../kernels/src/attention_q8_0_kv.hip");
 
+/// Batched counterpart of ATTENTION_Q8_0_KV_SRC. Processes N queries in
+/// one launch with per-row causal windows from a positions[] array.
+pub const ATTENTION_Q8_0_KV_BATCHED_SRC: &str = include_str!("../../../kernels/src/attention_q8_0_kv_batched.hip");
+
 
 /// Quantize KV vector to Q8 (int8 symmetric) and write to quantized KV cache.
 /// Per head: [4B f32 scale][head_dim × int8 values] = head_dim + 4 bytes.
@@ -442,6 +446,11 @@ pub const TOPK_LOGITS_SRC: &str = include_str!("../../../kernels/src/topk_logits
 /// Grid: [n_rot/2]. Block: [1]. Each thread handles one rotation pair.
 #[cfg(feature = "deltanet")]
 pub const ROPE_PARTIAL_INTERLEAVED_SRC: &str = include_str!("../../../kernels/src/rope_partial_interleaved.hip");
+
+/// Batched partial-interleaved RoPE — per-row positions read from a
+/// positions[] array. Used by the batched prefill FA path.
+#[cfg(feature = "deltanet")]
+pub const ROPE_PARTIAL_INTERLEAVED_BATCHED_SRC: &str = include_str!("../../../kernels/src/rope_partial_interleaved_batched.hip");
 
 
 /// 1D causal depthwise convolution (kernel_size=4) with persistent ring buffer state.

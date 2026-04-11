@@ -3055,6 +3055,80 @@ impl Gpu {
         result
     }
 
+    /// Batched causal attention with Q8_0 quantized KV cache. Processes N
+    /// queries in one launch; each query b has its own causal window read
+    /// from positions[b] (i.e. attend to 0..positions[b]+1). Q and out are
+    /// [batch_size × n_heads × head_dim] row-major; K/V caches are the same
+    /// layout as `attention_q8_0_kv` and must already contain the prefix
+    /// through positions[batch_size-1].
+    ///
+    /// Byte-exact with N single-token calls at batch_size=1, positions[0]=pos.
+    ///
+    /// `max_ctx_len` is the maximum seq_len = max(positions[b]) + 1 across
+    /// the batch; used to size the shared memory allocation for scores[].
+    pub fn attention_q8_0_kv_batched(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "attention_q8_0_kv_batched",
+            kernels::ATTENTION_Q8_0_KV_BATCHED_SRC,
+            "attention_q8_0_kv_batched",
+        )?;
+        let func = &self.functions["attention_q8_0_kv_batched"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut q_ptr = q.buf.as_ptr();
+        let mut k_ptr = k_cache.buf.as_ptr();
+        let mut v_ptr = v_cache.buf.as_ptr();
+        let mut out_ptr = out.buf.as_ptr();
+        let mut pos_ptr = positions.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut ms = max_seq as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q_ptr as *mut _ as *mut c_void,
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut v_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut ms as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        let block_size = (max_ctx_len.max(head_dim) as u32).next_power_of_two().min(256);
+        // Shared memory must accommodate the LARGEST batch row's seq_len for
+        // scores[], plus nthreads workspace and head_dim q_shared.
+        let shared_mem = ((max_ctx_len + block_size as usize + head_dim) * 4) as u32;
+        let bytes = crate::profile::attention_q8_0_kv_bytes(n_heads, n_kv_heads, head_dim, max_ctx_len) * batch_size;
+        let timer = crate::profile::begin_timer(&self.hip, "attention", "attention_q8_0_kv_batched", bytes);
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, batch_size as u32, 1],
+                [block_size, 1, 1],
+                shared_mem,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// Attention with Q8_0 quantized KV cache.
     pub fn attention_q8_0_kv(
         &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
@@ -3363,6 +3437,59 @@ impl Gpu {
         let bytes = crate::profile::rope_bytes(n_heads_q, n_heads_k, head_dim);
         let timer = crate::profile::begin_timer(&self.hip, "rope", "rope_partial_interleaved_f32", bytes);
         let result = unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params) };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// Batched partial-interleaved RoPE. Each batch row reads its absolute
+    /// position from positions[b] and rotates the first n_rot dims of every
+    /// Q and K head. Q/K are [batch_size × n_heads × head_dim] row-major.
+    /// Byte-exact with rope_partial_interleaved_f32 at batch_size=1.
+    pub fn rope_partial_interleaved_f32_batched(
+        &mut self,
+        q: &GpuTensor, k: &GpuTensor, positions: &GpuTensor,
+        n_heads_q: usize, n_heads_k: usize, head_dim: usize, n_rot: usize,
+        freq_base: f32, batch_size: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("rope_partial_interleaved_batched",
+            kernels::ROPE_PARTIAL_INTERLEAVED_BATCHED_SRC,
+            "rope_partial_interleaved_batched_f32")?;
+        let func = &self.functions["rope_partial_interleaved_batched_f32"];
+        let mut qp = q.buf.as_ptr();
+        let mut kp = k.buf.as_ptr();
+        let mut pp = positions.buf.as_ptr();
+        let mut nhq = n_heads_q as i32;
+        let mut nhk = n_heads_k as i32;
+        let mut hd = head_dim as i32;
+        let mut nr = n_rot as i32;
+        let mut fb = freq_base;
+        let mut bs = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void,
+            &mut nhq as *mut _ as *mut c_void,
+            &mut nhk as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut nr as *mut _ as *mut c_void,
+            &mut fb as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        let n_pairs = (n_rot / 2) as u32;
+        let block = 32u32.min(n_pairs);
+        let grid_x = (n_pairs + block - 1) / block;
+        let bytes = crate::profile::rope_bytes(n_heads_q, n_heads_k, head_dim) * batch_size;
+        let timer = crate::profile::begin_timer(&self.hip, "rope", "rope_partial_interleaved_batched_f32", bytes);
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid_x, batch_size as u32, 1],
+                [block, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
         if let Some(t) = timer { t.finish(&self.hip); }
         result
     }
