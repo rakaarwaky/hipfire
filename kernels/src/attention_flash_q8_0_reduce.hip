@@ -24,22 +24,26 @@
 
 extern "C" __launch_bounds__(32, 16)
 __global__ void attention_flash_q8_0_reduce(
-    const float* __restrict__ partials,  // [n_heads, n_tiles, 2 + head_dim]
+    const float* __restrict__ partials,  // [n_heads, max_tiles, 2 + head_dim]
     float* __restrict__ out,             // [n_heads, head_dim]
     int n_heads,
     int head_dim,
-    int n_tiles
+    const int* __restrict__ pos_buf,     // device buffer: pos_buf[0] = last position
+    int tile_size,                       // tile_size used by tile kernel (= blockDim.x of tile)
+    int max_tiles                        // partials buffer capacity per head
 ) {
     const int h = blockIdx.x;
     if (h >= n_heads) return;
     const int tid = threadIdx.x;
     const int d_base = tid * 4;
     const int stride = 2 + head_dim;
+    const int seq_len = pos_buf[0] + 1;
+    const int n_tiles = min((seq_len + tile_size - 1) / tile_size, max_tiles);
 
     // ═══ Pass 1: find global max across all tiles ═══
     float global_max = -1e30f;
     for (int tile = 0; tile < n_tiles; tile++) {
-        const float* p = partials + (h * n_tiles + tile) * stride;
+        const float* p = partials + (h * max_tiles + tile) * stride;
         float tile_sum = p[1];
         if (tile_sum > 0.0f)
             global_max = fmaxf(global_max, p[0]);
@@ -50,7 +54,7 @@ __global__ void attention_flash_q8_0_reduce(
     float g0 = 0.0f, g1 = 0.0f, g2 = 0.0f, g3 = 0.0f;
 
     for (int tile = 0; tile < n_tiles; tile++) {
-        const float* p = partials + (h * n_tiles + tile) * stride;
+        const float* p = partials + (h * max_tiles + tile) * stride;
         float tile_max = p[0];
         float tile_sum = p[1];
         if (tile_sum <= 0.0f) continue;

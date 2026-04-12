@@ -147,6 +147,9 @@ pub struct HipRuntime {
         unsafe extern "C" fn(HipGraphExec, HipStream) -> u32,
     fn_graph_exec_destroy: unsafe extern "C" fn(HipGraphExec) -> u32,
     fn_graph_destroy: unsafe extern "C" fn(HipGraph) -> u32,
+    // Stream memory ops (HIP 7.2+)
+    fn_stream_write_value32:
+        unsafe extern "C" fn(HipStream, *mut c_void, u32, c_uint) -> u32,
     fn_device_synchronize: unsafe extern "C" fn() -> u32,
     fn_get_device_properties: unsafe extern "C" fn(*mut u8, c_int) -> u32,
     fn_mem_get_info: unsafe extern "C" fn(*mut usize, *mut usize) -> u32,
@@ -242,6 +245,8 @@ impl HipRuntime {
                 fn_graph_launch: load_fn!(lib, "hipGraphLaunch", unsafe extern "C" fn(HipGraphExec, HipStream) -> u32),
                 fn_graph_exec_destroy: load_fn!(lib, "hipGraphExecDestroy", unsafe extern "C" fn(HipGraphExec) -> u32),
                 fn_graph_destroy: load_fn!(lib, "hipGraphDestroy", unsafe extern "C" fn(HipGraph) -> u32),
+                fn_stream_write_value32: load_fn!(lib, "hipStreamWriteValue32",
+                    unsafe extern "C" fn(HipStream, *mut c_void, u32, c_uint) -> u32),
                 fn_device_synchronize: load_fn!(lib, "hipDeviceSynchronize", unsafe extern "C" fn() -> u32),
                 fn_get_device_properties: load_fn!(lib, "hipGetDeviceProperties", unsafe extern "C" fn(*mut u8, c_int) -> u32),
                 fn_mem_get_info: load_fn!(lib, "hipMemGetInfo", unsafe extern "C" fn(*mut usize, *mut usize) -> u32),
@@ -716,6 +721,15 @@ impl HipRuntime {
         let code = unsafe { (self.fn_graph_destroy)(graph.0) };
         std::mem::forget(graph);
         self.check(code, "hipGraphDestroy")
+    }
+
+    /// Write a 32-bit value to a device address on the stream.
+    /// The write is ordered with respect to other operations on the stream.
+    /// Graph-safe: can be used before hipGraphLaunch to update device state
+    /// that captured kernels will read (e.g., position buffers).
+    pub fn stream_write_value32(&self, stream: &Stream, ptr: &DeviceBuffer, value: u32, flags: u32) -> HipResult<()> {
+        let code = unsafe { (self.fn_stream_write_value32)(stream.0, ptr.as_ptr(), value, flags) };
+        self.check(code, "hipStreamWriteValue32")
     }
 
     pub fn device_synchronize(&self) -> HipResult<()> {

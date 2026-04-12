@@ -129,7 +129,7 @@ pub struct Gpu {
     /// Heap-stored kernarg blobs for the current capture session. The blob
     /// pointers are baked into the graph at capture time — do NOT clear this
     /// vec until after `graph_exec_destroy`.
-    capture_blobs: Vec<Vec<u8>>,
+    pub capture_blobs: Vec<Vec<u8>>,
     /// The captured graph exec, ready for replay.
     pub graph_exec: Option<hip_bridge::GraphExec>,
     /// The raw captured graph (kept alive for potential update operations).
@@ -3249,7 +3249,12 @@ impl Gpu {
         partials: &GpuTensor,
     ) -> HipResult<()> {
         const TILE_SIZE: usize = 128;
-        let n_tiles = (seq_len_hint + TILE_SIZE - 1) / TILE_SIZE;
+        // Graph-safe: use max_tiles so the grid is position-independent.
+        // The tile kernel exits early for tiles beyond actual seq_len.
+        let max_tiles = (max_seq + TILE_SIZE - 1) / TILE_SIZE;
+        // For profiling / non-graph code paths, the actual tile count:
+        let actual_tiles = (seq_len_hint + TILE_SIZE - 1) / TILE_SIZE;
+        let launch_tiles = if self.capture_mode { max_tiles } else { actual_tiles };
 
         // ── Tile kernel ──
         self.ensure_kernel(
@@ -3258,71 +3263,68 @@ impl Gpu {
             "attention_flash_q8_0_tile",
         )?;
         {
-            let func = &self.functions["attention_flash_q8_0_tile"];
             let scale = 1.0f32 / (head_dim as f32).sqrt();
-            let mut q_ptr = q.buf.as_ptr();
-            let mut k_ptr = k_cache.buf.as_ptr();
-            let mut v_ptr = v_cache.buf.as_ptr();
-            let mut p_ptr = partials.buf.as_ptr();
-            let mut pos_ptr = pos_buf.as_ptr();
-            let mut nh = n_heads as i32; let mut nkv = n_kv_heads as i32;
-            let mut hd = head_dim as i32; let mut ms = max_seq as i32;
-            let mut sc = scale; let mut ts = TILE_SIZE as i32;
+            let q_ptr = q.buf.as_ptr();
+            let k_ptr = k_cache.buf.as_ptr();
+            let v_ptr = v_cache.buf.as_ptr();
+            let p_ptr = partials.buf.as_ptr();
+            let pos_ptr = pos_buf.as_ptr();
+            let nh = n_heads as i32; let nkv = n_kv_heads as i32;
+            let hd = head_dim as i32; let ms = max_seq as i32;
+            let sc = scale; let ts = TILE_SIZE as i32;
+            let grid = [n_heads as u32, launch_tiles as u32, 1];
+            let shared = ((TILE_SIZE + head_dim) * 4) as u32;
             let mut params: Vec<*mut c_void> = vec![
-                &mut q_ptr as *mut _ as *mut c_void,
-                &mut k_ptr as *mut _ as *mut c_void,
-                &mut v_ptr as *mut _ as *mut c_void,
-                &mut p_ptr as *mut _ as *mut c_void,
-                &mut pos_ptr as *mut _ as *mut c_void,
-                &mut nh as *mut _ as *mut c_void,
-                &mut nkv as *mut _ as *mut c_void,
-                &mut hd as *mut _ as *mut c_void,
-                &mut ms as *mut _ as *mut c_void,
-                &mut sc as *mut _ as *mut c_void,
-                &mut ts as *mut _ as *mut c_void,
+                &q_ptr as *const _ as *mut c_void, &k_ptr as *const _ as *mut c_void,
+                &v_ptr as *const _ as *mut c_void, &p_ptr as *const _ as *mut c_void,
+                &pos_ptr as *const _ as *mut c_void, &nh as *const _ as *mut c_void,
+                &nkv as *const _ as *mut c_void, &hd as *const _ as *mut c_void,
+                &ms as *const _ as *mut c_void, &sc as *const _ as *mut c_void,
+                &ts as *const _ as *mut c_void,
             ];
-            unsafe {
-                self.hip.launch_kernel(
-                    func,
-                    [n_heads as u32, n_tiles as u32, 1],
-                    [32, 1, 1],
-                    ((TILE_SIZE + head_dim) * 4) as u32, // scores[tile_size] + q_lds[head_dim]
-                    self.stream_ref(),
-                    &mut params,
-                )?;
-            }
+            self.launch_maybe_blob(
+                "attention_flash_q8_0_tile", grid, [32, 1, 1], shared, &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(q_ptr); b.push_ptr(k_ptr); b.push_ptr(v_ptr);
+                    b.push_ptr(p_ptr); b.push_ptr(pos_ptr);
+                    b.push_i32(nh); b.push_i32(nkv); b.push_i32(hd); b.push_i32(ms);
+                    b.push_f32(sc); b.push_i32(ts);
+                    b
+                },
+            )?;
         }
 
-        // ── Reduce kernel ──
+        // ── Reduce kernel (reads seq_len from pos_buf, computes n_tiles) ──
         self.ensure_kernel(
             "attention_flash_q8_0_reduce",
             kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC,
             "attention_flash_q8_0_reduce",
         )?;
         {
-            let func = &self.functions["attention_flash_q8_0_reduce"];
-            let mut p_ptr = partials.buf.as_ptr();
-            let mut o_ptr = out.buf.as_ptr();
-            let mut nh = n_heads as i32;
-            let mut hd = head_dim as i32;
-            let mut nt = n_tiles as i32;
+            let p_ptr = partials.buf.as_ptr();
+            let o_ptr = out.buf.as_ptr();
+            let nh = n_heads as i32;
+            let hd = head_dim as i32;
+            let pos_ptr = pos_buf.as_ptr();
+            let ts = TILE_SIZE as i32;
+            let mt = max_tiles as i32;
             let mut params: Vec<*mut c_void> = vec![
-                &mut p_ptr as *mut _ as *mut c_void,
-                &mut o_ptr as *mut _ as *mut c_void,
-                &mut nh as *mut _ as *mut c_void,
-                &mut hd as *mut _ as *mut c_void,
-                &mut nt as *mut _ as *mut c_void,
+                &p_ptr as *const _ as *mut c_void, &o_ptr as *const _ as *mut c_void,
+                &nh as *const _ as *mut c_void, &hd as *const _ as *mut c_void,
+                &pos_ptr as *const _ as *mut c_void, &ts as *const _ as *mut c_void,
+                &mt as *const _ as *mut c_void,
             ];
-            unsafe {
-                self.hip.launch_kernel(
-                    func,
-                    [n_heads as u32, 1, 1],
-                    [32, 1, 1],
-                    0,
-                    self.stream_ref(),
-                    &mut params,
-                )?;
-            }
+            self.launch_maybe_blob(
+                "attention_flash_q8_0_reduce", [n_heads as u32, 1, 1], [32, 1, 1], 0, &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(p_ptr); b.push_ptr(o_ptr);
+                    b.push_i32(nh); b.push_i32(hd);
+                    b.push_ptr(pos_ptr); b.push_i32(ts); b.push_i32(mt);
+                    b
+                },
+            )?;
         }
         Ok(())
     }

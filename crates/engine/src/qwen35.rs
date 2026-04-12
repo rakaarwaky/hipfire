@@ -1112,10 +1112,9 @@ pub fn forward_scratch(
     scratch: &Qwen35Scratch,
 ) -> HipResult<()> {
     let dim = config.dim;
-    let pos_i32 = pos as i32;
-    gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+    let use_graph = std::env::var("HIPFIRE_GRAPH").ok().as_deref() == Some("1");
 
-    // Embedding lookup into scratch.x
+    // Embedding lookup into scratch.x (always direct, changes per token)
     match weights.embd_format {
         EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(&weights.token_embd, &scratch.x, token, dim)?,
         EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.token_embd, &scratch.x, token, dim)?,
@@ -1124,7 +1123,32 @@ pub fn forward_scratch(
         _ => panic!("unsupported embedding format"),
     }
 
-    forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)
+    if use_graph && gpu.graph_exec.is_some() {
+        // ── Graph replay path ──
+        // Update pos_buf on the device via stream write (no host→device copy).
+        let stream = gpu.active_stream.as_ref().unwrap();
+        gpu.hip.stream_write_value32(stream, &scratch.pos_buf, pos as u32, 0)?;
+        gpu.graph_launch()?;
+    } else if use_graph && gpu.graph_exec.is_none() {
+        // ── First decode: capture the forward pass as a graph ──
+        // Ensure we have an explicit stream for capture.
+        if gpu.active_stream.is_none() {
+            gpu.active_stream = Some(gpu.hip.stream_create()?);
+        }
+        // Write pos_buf before capture (this write is NOT in the graph)
+        let pos_i32 = pos as i32;
+        gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+        gpu.begin_graph_capture()?;
+        forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)?;
+        gpu.end_graph_capture()?;
+        eprintln!("[hipGraph] captured {} blobs, instantiated", gpu.capture_blobs.len());
+    } else {
+        // ── Direct path (no graph) ──
+        let pos_i32 = pos as i32;
+        gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+        forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)?;
+    }
+    Ok(())
 }
 
 /// Per-layer batched intermediates used by `forward_prefill_batch`. Each
@@ -2354,7 +2378,9 @@ fn forward_scratch_layers(
                 } else if kv_cache.quant_q8 {
                     gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
                     gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
-                    if (s.use_flash_attn && pos + 1 >= 2048) || pos + 1 > 15000 {
+                    // Graph mode: always use flash (position-independent grid).
+                    // Non-graph: use flash when context >= 2048 (or >= 15K if no flash flag).
+                    if gpu.capture_mode || (s.use_flash_attn && pos + 1 >= 2048) || pos + 1 > 15000 {
                         gpu.attention_flash_q8_0(
                             &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                             &s.fa_attn_out, &s.pos_buf, pos + 1,
