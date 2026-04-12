@@ -3232,6 +3232,594 @@ impl Gpu {
         Ok(())
     }
 
+    /// Compile a givens4 kernel — prepends turbo_common + givens_common headers.
+    fn ensure_givens4_kernel(&mut self, name: &str, body_src: &str, func_name: &str) -> HipResult<()> {
+        if self.functions.contains_key(func_name) {
+            return Ok(());
+        }
+        let stripped = body_src
+            .replace("#include \"turbo_common.h\"", "")
+            .replace("#include \"givens_common.h\"", "");
+        let full_src = format!("{}\n{}\n{}", kernels::TURBO_COMMON_SRC, kernels::GIVENS_COMMON_SRC, stripped);
+        let obj_path = self.compiler.compile(name, &full_src)?;
+        let obj_path_str = obj_path.to_str().unwrap().to_string();
+        if !self.modules.contains_key(name) {
+            let module = self.hip.module_load(&obj_path_str)?;
+            self.modules.insert(name.to_string(), module);
+        }
+        let module = &self.modules[name];
+        let func = self.hip.module_get_function(module, func_name)?;
+        self.functions.insert(func_name.to_string(), func);
+        Ok(())
+    }
+
+    /// Fused K+V write for givens4 (block-diagonal Givens rotation + 4-bit quantize).
+    pub fn kv_cache_write_givens4_fused(
+        &mut self, k_dst: &GpuTensor, v_dst: &GpuTensor,
+        k_src: &GpuTensor, v_src: &GpuTensor, pos_buf: &DeviceBuffer,
+        cos_theta: &GpuTensor, sin_theta: &GpuTensor,
+        n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.ensure_givens4_kernel("kv_cache_write_givens4", kernels::KV_CACHE_WRITE_GIVENS4_SRC, "kv_cache_write_givens4")?;
+        let func = &self.functions["kv_cache_write_givens4"];
+        let mut kdp = k_dst.buf.as_ptr(); let mut vdp = v_dst.buf.as_ptr();
+        let mut ksp = k_src.buf.as_ptr(); let mut vsp = v_src.buf.as_ptr();
+        let mut pp = pos_buf.as_ptr();
+        let mut ctp = cos_theta.buf.as_ptr(); let mut stp = sin_theta.buf.as_ptr();
+        let mut nkv = n_kv_heads as i32; let mut hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut kdp as *mut _ as *mut c_void, &mut vdp as *mut _ as *mut c_void,
+            &mut ksp as *mut _ as *mut c_void, &mut vsp as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void,
+            &mut ctp as *mut _ as *mut c_void, &mut stp as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
+        ];
+        let shared_mem = ((head_dim + 32) * 4) as u32;
+        unsafe { self.hip.launch_kernel(func, [n_kv_heads as u32, 1, 1], [32, 1, 1], shared_mem, self.stream_ref(), &mut params) }
+    }
+
+    /// Batched givens4 KV write — processes N positions in one launch for prefill.
+    pub fn kv_cache_write_givens4_batched(
+        &mut self, dst: &GpuTensor, src: &GpuTensor, positions: &GpuTensor,
+        cos_theta: &GpuTensor, sin_theta: &GpuTensor,
+        n_kv_heads: usize, head_dim: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.ensure_givens4_kernel("kv_cache_write_givens4_batched", kernels::KV_CACHE_WRITE_GIVENS4_BATCHED_SRC, "kv_cache_write_givens4_batched")?;
+        let func = &self.functions["kv_cache_write_givens4_batched"];
+        let mut dp = dst.buf.as_ptr(); let mut sp = src.buf.as_ptr();
+        let mut pp = positions.buf.as_ptr();
+        let mut ctp = cos_theta.buf.as_ptr(); let mut stp = sin_theta.buf.as_ptr();
+        let mut nkv = n_kv_heads as i32; let mut hd = head_dim as i32;
+        let mut bs = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut dp as *mut _ as *mut c_void, &mut sp as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void,
+            &mut ctp as *mut _ as *mut c_void, &mut stp as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        let shared_mem = ((head_dim + 32) * 4) as u32;
+        unsafe { self.hip.launch_kernel(
+            func,
+            [n_kv_heads as u32, batch_size as u32, 1],
+            [32, 1, 1],
+            shared_mem,
+            self.stream_ref(),
+            &mut params,
+        ) }
+    }
+
+    /// Batched flash attention for givens4 KV cache during prefill.
+    /// Processes batch_size positions with sub-batching to limit partials VRAM.
+    /// Q and out are [batch_size × n_heads × head_dim] row-major.
+    /// Allocates its own partials buffer internally (sized for sub-batch).
+    pub fn attention_flash_givens4_batched(
+        &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
+        out: &GpuTensor, positions: &GpuTensor,
+        cos_theta: &GpuTensor, sin_theta: &GpuTensor,
+        n_heads: usize, n_kv_heads: usize, head_dim: usize,
+        max_seq: usize, max_ctx_len: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        const TILE_SIZE: usize = 128;
+        let max_tiles = (max_ctx_len + TILE_SIZE - 1) / TILE_SIZE;
+        let stride = 2 + head_dim;
+        // Sub-batch: limit partials to ~32 MB
+        let per_pos_bytes = n_heads * max_tiles * stride * 4;
+        let sub_batch = if per_pos_bytes > 0 { (32 * 1024 * 1024 / per_pos_bytes).max(1).min(batch_size) } else { batch_size };
+        // Allocate partials for the sub-batch
+        let partials_elems = sub_batch * n_heads * max_tiles * stride;
+        let partials = self.alloc_tensor(&[partials_elems], crate::DType::F32)?;
+
+        self.ensure_givens4_kernel(
+            "attention_flash_givens4_tile_batched",
+            kernels::ATTENTION_FLASH_GIVENS4_TILE_BATCHED_SRC,
+            "attention_flash_givens4_tile_batched",
+        )?;
+        self.ensure_givens4_kernel(
+            "attention_flash_givens4_reduce_batched",
+            kernels::ATTENTION_FLASH_GIVENS4_REDUCE_BATCHED_SRC,
+            "attention_flash_givens4_reduce_batched",
+        )?;
+
+        let q_dim = n_heads * head_dim;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut offset = 0usize;
+        while offset < batch_size {
+            let chunk = (batch_size - offset).min(sub_batch);
+
+            // Tile kernel: grid [n_heads, max_tiles, chunk]
+            {
+                let func = &self.functions["attention_flash_givens4_tile_batched"];
+                let mut q_ptr = unsafe { (q.buf.as_ptr() as *mut u8).add(offset * q_dim * 4) as *mut std::ffi::c_void };
+                let mut k_ptr = k_cache.buf.as_ptr();
+                let mut v_ptr = v_cache.buf.as_ptr();
+                let mut p_ptr = partials.buf.as_ptr();
+                let mut pos_ptr = positions.buf.as_ptr();
+                let mut ct_ptr = cos_theta.buf.as_ptr();
+                let mut st_ptr = sin_theta.buf.as_ptr();
+                let mut nh = n_heads as i32; let mut nkv = n_kv_heads as i32;
+                let mut hd = head_dim as i32; let mut ms = max_seq as i32;
+                let mut sc = scale; let mut ts = TILE_SIZE as i32;
+                let mut mt = max_tiles as i32; let mut bo = offset as i32;
+                let mut params: Vec<*mut c_void> = vec![
+                    &mut q_ptr as *mut _ as *mut c_void,
+                    &mut k_ptr as *mut _ as *mut c_void,
+                    &mut v_ptr as *mut _ as *mut c_void,
+                    &mut p_ptr as *mut _ as *mut c_void,
+                    &mut pos_ptr as *mut _ as *mut c_void,
+                    &mut ct_ptr as *mut _ as *mut c_void,
+                    &mut st_ptr as *mut _ as *mut c_void,
+                    &mut nh as *mut _ as *mut c_void,
+                    &mut nkv as *mut _ as *mut c_void,
+                    &mut hd as *mut _ as *mut c_void,
+                    &mut ms as *mut _ as *mut c_void,
+                    &mut sc as *mut _ as *mut c_void,
+                    &mut ts as *mut _ as *mut c_void,
+                    &mut mt as *mut _ as *mut c_void,
+                    &mut bo as *mut _ as *mut c_void,
+                ];
+                unsafe {
+                    self.hip.launch_kernel(
+                        func,
+                        [n_heads as u32, max_tiles as u32, chunk as u32],
+                        [32, 1, 1],
+                        (TILE_SIZE * 4) as u32,
+                        self.stream_ref(),
+                        &mut params,
+                    )?;
+                }
+            }
+
+            // Reduce kernel: grid [n_heads, chunk]
+            {
+                let func = &self.functions["attention_flash_givens4_reduce_batched"];
+                let mut p_ptr = partials.buf.as_ptr();
+                let mut o_ptr = unsafe { (out.buf.as_ptr() as *mut u8).add(offset * q_dim * 4) as *mut std::ffi::c_void };
+                let mut pos_ptr = positions.buf.as_ptr();
+                let mut ct_ptr = cos_theta.buf.as_ptr();
+                let mut st_ptr = sin_theta.buf.as_ptr();
+                let mut nh = n_heads as i32; let mut hd = head_dim as i32;
+                let mut ts = TILE_SIZE as i32; let mut mt = max_tiles as i32;
+                let mut bo = offset as i32;
+                let mut params: Vec<*mut c_void> = vec![
+                    &mut p_ptr as *mut _ as *mut c_void,
+                    &mut o_ptr as *mut _ as *mut c_void,
+                    &mut pos_ptr as *mut _ as *mut c_void,
+                    &mut ct_ptr as *mut _ as *mut c_void,
+                    &mut st_ptr as *mut _ as *mut c_void,
+                    &mut nh as *mut _ as *mut c_void,
+                    &mut hd as *mut _ as *mut c_void,
+                    &mut ts as *mut _ as *mut c_void,
+                    &mut mt as *mut _ as *mut c_void,
+                    &mut bo as *mut _ as *mut c_void,
+                ];
+                unsafe {
+                    self.hip.launch_kernel(
+                        func,
+                        [n_heads as u32, chunk as u32, 1],
+                        [32, 1, 1],
+                        0,
+                        self.stream_ref(),
+                        &mut params,
+                    )?;
+                }
+            }
+            offset += chunk;
+        }
+        Ok(())
+    }
+
+    // ── givens2: 2-bit, 36 bytes/head (hd=128) ──
+
+    pub fn kv_cache_write_givens2_fused(
+        &mut self, k_dst: &GpuTensor, v_dst: &GpuTensor,
+        k_src: &GpuTensor, v_src: &GpuTensor, pos_buf: &DeviceBuffer,
+        cos_theta: &GpuTensor, sin_theta: &GpuTensor,
+        n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.ensure_givens4_kernel("kv_cache_write_givens2", kernels::KV_CACHE_WRITE_GIVENS2_SRC, "kv_cache_write_givens2")?;
+        let func = &self.functions["kv_cache_write_givens2"];
+        let mut kdp = k_dst.buf.as_ptr(); let mut vdp = v_dst.buf.as_ptr();
+        let mut ksp = k_src.buf.as_ptr(); let mut vsp = v_src.buf.as_ptr();
+        let mut pp = pos_buf.as_ptr();
+        let mut ctp = cos_theta.buf.as_ptr(); let mut stp = sin_theta.buf.as_ptr();
+        let mut nkv = n_kv_heads as i32; let mut hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut kdp as *mut _ as *mut c_void, &mut vdp as *mut _ as *mut c_void,
+            &mut ksp as *mut _ as *mut c_void, &mut vsp as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void,
+            &mut ctp as *mut _ as *mut c_void, &mut stp as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
+        ];
+        let shared_mem = ((head_dim + 32) * 4) as u32;
+        unsafe { self.hip.launch_kernel(func, [n_kv_heads as u32, 1, 1], [32, 1, 1], shared_mem, self.stream_ref(), &mut params) }
+    }
+
+    pub fn kv_cache_write_givens2_batched(
+        &mut self, dst: &GpuTensor, src: &GpuTensor, positions: &GpuTensor,
+        cos_theta: &GpuTensor, sin_theta: &GpuTensor,
+        n_kv_heads: usize, head_dim: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.ensure_givens4_kernel("kv_cache_write_givens2_batched", kernels::KV_CACHE_WRITE_GIVENS2_BATCHED_SRC, "kv_cache_write_givens2_batched")?;
+        let func = &self.functions["kv_cache_write_givens2_batched"];
+        let mut dp = dst.buf.as_ptr(); let mut sp = src.buf.as_ptr();
+        let mut pp = positions.buf.as_ptr();
+        let mut ctp = cos_theta.buf.as_ptr(); let mut stp = sin_theta.buf.as_ptr();
+        let mut nkv = n_kv_heads as i32; let mut hd = head_dim as i32; let mut bs = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut dp as *mut _ as *mut c_void, &mut sp as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void,
+            &mut ctp as *mut _ as *mut c_void, &mut stp as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        let shared_mem = ((head_dim + 32) * 4) as u32;
+        unsafe { self.hip.launch_kernel(func, [n_kv_heads as u32, batch_size as u32, 1], [32, 1, 1], shared_mem, self.stream_ref(), &mut params) }
+    }
+
+    pub fn attention_flash_givens2(
+        &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
+        out: &GpuTensor, pos_buf: &DeviceBuffer,
+        cos_theta: &GpuTensor, sin_theta: &GpuTensor,
+        seq_len_hint: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
+        partials: &GpuTensor,
+    ) -> HipResult<()> {
+        const TILE_SIZE: usize = 128;
+        let n_tiles = (seq_len_hint + TILE_SIZE - 1) / TILE_SIZE;
+        self.ensure_givens4_kernel("attention_flash_givens2_tile", kernels::ATTENTION_FLASH_GIVENS2_TILE_SRC, "attention_flash_givens2_tile")?;
+        // Reuse givens4 reduce (bit-width independent)
+        self.ensure_givens4_kernel("attention_flash_givens4_reduce", kernels::ATTENTION_FLASH_GIVENS4_REDUCE_SRC, "attention_flash_givens4_reduce")?;
+        {
+            let func = &self.functions["attention_flash_givens2_tile"];
+            let scale = 1.0f32 / (head_dim as f32).sqrt();
+            let mut q_ptr = q.buf.as_ptr(); let mut k_ptr = k_cache.buf.as_ptr();
+            let mut v_ptr = v_cache.buf.as_ptr(); let mut p_ptr = partials.buf.as_ptr();
+            let mut pos_ptr = pos_buf.as_ptr();
+            let mut ct_ptr = cos_theta.buf.as_ptr(); let mut st_ptr = sin_theta.buf.as_ptr();
+            let mut nh = n_heads as i32; let mut nkv = n_kv_heads as i32;
+            let mut hd = head_dim as i32; let mut ms = max_seq as i32;
+            let mut sc = scale; let mut ts = TILE_SIZE as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &mut q_ptr as *mut _ as *mut c_void, &mut k_ptr as *mut _ as *mut c_void,
+                &mut v_ptr as *mut _ as *mut c_void, &mut p_ptr as *mut _ as *mut c_void,
+                &mut pos_ptr as *mut _ as *mut c_void,
+                &mut ct_ptr as *mut _ as *mut c_void, &mut st_ptr as *mut _ as *mut c_void,
+                &mut nh as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void, &mut ms as *mut _ as *mut c_void,
+                &mut sc as *mut _ as *mut c_void, &mut ts as *mut _ as *mut c_void,
+            ];
+            unsafe { self.hip.launch_kernel(func, [n_heads as u32, n_tiles as u32, 1], [32, 1, 1], (TILE_SIZE * 4) as u32, self.stream_ref(), &mut params)?; }
+        }
+        {
+            let func = &self.functions["attention_flash_givens4_reduce"];
+            let mut p_ptr = partials.buf.as_ptr(); let mut o_ptr = out.buf.as_ptr();
+            let mut ct_ptr = cos_theta.buf.as_ptr(); let mut st_ptr = sin_theta.buf.as_ptr();
+            let mut nh = n_heads as i32; let mut hd = head_dim as i32; let mut nt = n_tiles as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &mut p_ptr as *mut _ as *mut c_void, &mut o_ptr as *mut _ as *mut c_void,
+                &mut ct_ptr as *mut _ as *mut c_void, &mut st_ptr as *mut _ as *mut c_void,
+                &mut nh as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void, &mut nt as *mut _ as *mut c_void,
+            ];
+            unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params)?; }
+        }
+        Ok(())
+    }
+
+    pub fn attention_flash_givens2_batched(
+        &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
+        out: &GpuTensor, positions: &GpuTensor,
+        cos_theta: &GpuTensor, sin_theta: &GpuTensor,
+        n_heads: usize, n_kv_heads: usize, head_dim: usize,
+        max_seq: usize, max_ctx_len: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        const TILE_SIZE: usize = 128;
+        let max_tiles = (max_ctx_len + TILE_SIZE - 1) / TILE_SIZE;
+        let stride = 2 + head_dim;
+        let per_pos_bytes = n_heads * max_tiles * stride * 4;
+        let sub_batch = if per_pos_bytes > 0 { (32 * 1024 * 1024 / per_pos_bytes).max(1).min(batch_size) } else { batch_size };
+        let partials_elems = sub_batch * n_heads * max_tiles * stride;
+        let partials = self.alloc_tensor(&[partials_elems], crate::DType::F32)?;
+
+        self.ensure_givens4_kernel("attention_flash_givens2_tile_batched", kernels::ATTENTION_FLASH_GIVENS2_TILE_BATCHED_SRC, "attention_flash_givens2_tile_batched")?;
+        self.ensure_givens4_kernel("attention_flash_givens4_reduce_batched", kernels::ATTENTION_FLASH_GIVENS4_REDUCE_BATCHED_SRC, "attention_flash_givens4_reduce_batched")?;
+
+        let q_dim = n_heads * head_dim;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut offset = 0usize;
+        while offset < batch_size {
+            let chunk = (batch_size - offset).min(sub_batch);
+            {
+                let func = &self.functions["attention_flash_givens2_tile_batched"];
+                let mut q_ptr = unsafe { (q.buf.as_ptr() as *mut u8).add(offset * q_dim * 4) as *mut std::ffi::c_void };
+                let mut k_ptr = k_cache.buf.as_ptr(); let mut v_ptr = v_cache.buf.as_ptr();
+                let mut p_ptr = partials.buf.as_ptr(); let mut pos_ptr = positions.buf.as_ptr();
+                let mut ct_ptr = cos_theta.buf.as_ptr(); let mut st_ptr = sin_theta.buf.as_ptr();
+                let mut nh = n_heads as i32; let mut nkv = n_kv_heads as i32;
+                let mut hd = head_dim as i32; let mut ms = max_seq as i32;
+                let mut sc = scale; let mut ts = TILE_SIZE as i32;
+                let mut mt = max_tiles as i32; let mut bo = offset as i32;
+                let mut params: Vec<*mut c_void> = vec![
+                    &mut q_ptr as *mut _ as *mut c_void, &mut k_ptr as *mut _ as *mut c_void,
+                    &mut v_ptr as *mut _ as *mut c_void, &mut p_ptr as *mut _ as *mut c_void,
+                    &mut pos_ptr as *mut _ as *mut c_void,
+                    &mut ct_ptr as *mut _ as *mut c_void, &mut st_ptr as *mut _ as *mut c_void,
+                    &mut nh as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
+                    &mut hd as *mut _ as *mut c_void, &mut ms as *mut _ as *mut c_void,
+                    &mut sc as *mut _ as *mut c_void, &mut ts as *mut _ as *mut c_void,
+                    &mut mt as *mut _ as *mut c_void, &mut bo as *mut _ as *mut c_void,
+                ];
+                unsafe { self.hip.launch_kernel(func, [n_heads as u32, max_tiles as u32, chunk as u32], [32, 1, 1], (TILE_SIZE * 4) as u32, self.stream_ref(), &mut params)?; }
+            }
+            {
+                let func = &self.functions["attention_flash_givens4_reduce_batched"];
+                let mut p_ptr = partials.buf.as_ptr();
+                let mut o_ptr = unsafe { (out.buf.as_ptr() as *mut u8).add(offset * q_dim * 4) as *mut std::ffi::c_void };
+                let mut pos_ptr = positions.buf.as_ptr();
+                let mut ct_ptr = cos_theta.buf.as_ptr(); let mut st_ptr = sin_theta.buf.as_ptr();
+                let mut nh = n_heads as i32; let mut hd = head_dim as i32;
+                let mut ts = TILE_SIZE as i32; let mut mt = max_tiles as i32; let mut bo = offset as i32;
+                let mut params: Vec<*mut c_void> = vec![
+                    &mut p_ptr as *mut _ as *mut c_void, &mut o_ptr as *mut _ as *mut c_void,
+                    &mut pos_ptr as *mut _ as *mut c_void,
+                    &mut ct_ptr as *mut _ as *mut c_void, &mut st_ptr as *mut _ as *mut c_void,
+                    &mut nh as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
+                    &mut ts as *mut _ as *mut c_void, &mut mt as *mut _ as *mut c_void, &mut bo as *mut _ as *mut c_void,
+                ];
+                unsafe { self.hip.launch_kernel(func, [n_heads as u32, chunk as u32, 1], [32, 1, 1], 0, self.stream_ref(), &mut params)?; }
+            }
+            offset += chunk;
+        }
+        Ok(())
+    }
+
+    /// Bulk convert Q8_0 KV cache → givens4 format. Runs once at the switch point.
+    /// Reads Q8_0 blocks, dequants, applies Givens forward, quantizes to 4-bit centroids.
+    pub fn convert_q8_to_givens4(
+        &mut self,
+        k_q8: &GpuTensor, v_q8: &GpuTensor,
+        k_g4: &GpuTensor, v_g4: &GpuTensor,
+        cos_theta: &GpuTensor, sin_theta: &GpuTensor,
+        n_kv_heads: usize, head_dim: usize, n_positions: usize,
+    ) -> HipResult<()> {
+        self.ensure_givens4_kernel("convert_q8_to_givens4", kernels::CONVERT_Q8_TO_GIVENS4_SRC, "convert_q8_to_givens4")?;
+        let func = &self.functions["convert_q8_to_givens4"];
+        let mut kq = k_q8.buf.as_ptr(); let mut vq = v_q8.buf.as_ptr();
+        let mut kg = k_g4.buf.as_ptr(); let mut vg = v_g4.buf.as_ptr();
+        let mut ctp = cos_theta.buf.as_ptr(); let mut stp = sin_theta.buf.as_ptr();
+        let mut nkv = n_kv_heads as i32; let mut hd = head_dim as i32;
+        let mut np = n_positions as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut kq as *mut _ as *mut c_void, &mut vq as *mut _ as *mut c_void,
+            &mut kg as *mut _ as *mut c_void, &mut vg as *mut _ as *mut c_void,
+            &mut ctp as *mut _ as *mut c_void, &mut stp as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
+            &mut np as *mut _ as *mut c_void,
+        ];
+        let shared_mem = ((head_dim + 32) * 4) as u32;
+        unsafe { self.hip.launch_kernel(
+            func,
+            [n_kv_heads as u32, n_positions as u32, 1],
+            [32, 1, 1],
+            shared_mem,
+            self.stream_ref(),
+            &mut params,
+        ) }
+    }
+
+    /// Flash attention with givens4 KV cache — tile + reduce two-kernel path.
+    /// Block-diagonal Givens rotation: register-local, flash-compatible by design.
+    pub fn attention_flash_givens4(
+        &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
+        out: &GpuTensor, pos_buf: &DeviceBuffer,
+        cos_theta: &GpuTensor, sin_theta: &GpuTensor,
+        seq_len_hint: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
+        partials: &GpuTensor,
+    ) -> HipResult<()> {
+        const TILE_SIZE: usize = 128;
+        let n_tiles = (seq_len_hint + TILE_SIZE - 1) / TILE_SIZE;
+
+        // ── Tile kernel ──
+        self.ensure_givens4_kernel(
+            "attention_flash_givens4_tile",
+            kernels::ATTENTION_FLASH_GIVENS4_TILE_SRC,
+            "attention_flash_givens4_tile",
+        )?;
+        {
+            let func = &self.functions["attention_flash_givens4_tile"];
+            let scale = 1.0f32 / (head_dim as f32).sqrt();
+            let mut q_ptr = q.buf.as_ptr();
+            let mut k_ptr = k_cache.buf.as_ptr();
+            let mut v_ptr = v_cache.buf.as_ptr();
+            let mut p_ptr = partials.buf.as_ptr();
+            let mut pos_ptr = pos_buf.as_ptr();
+            let mut ct_ptr = cos_theta.buf.as_ptr();
+            let mut st_ptr = sin_theta.buf.as_ptr();
+            let mut nh = n_heads as i32; let mut nkv = n_kv_heads as i32;
+            let mut hd = head_dim as i32; let mut ms = max_seq as i32;
+            let mut sc = scale; let mut ts = TILE_SIZE as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &mut q_ptr as *mut _ as *mut c_void,
+                &mut k_ptr as *mut _ as *mut c_void,
+                &mut v_ptr as *mut _ as *mut c_void,
+                &mut p_ptr as *mut _ as *mut c_void,
+                &mut pos_ptr as *mut _ as *mut c_void,
+                &mut ct_ptr as *mut _ as *mut c_void,
+                &mut st_ptr as *mut _ as *mut c_void,
+                &mut nh as *mut _ as *mut c_void,
+                &mut nkv as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void,
+                &mut ms as *mut _ as *mut c_void,
+                &mut sc as *mut _ as *mut c_void,
+                &mut ts as *mut _ as *mut c_void,
+            ];
+            unsafe {
+                self.hip.launch_kernel(
+                    func,
+                    [n_heads as u32, n_tiles as u32, 1],
+                    [32, 1, 1],
+                    (TILE_SIZE * 4) as u32, // scores[tile_size] only
+                    self.stream_ref(),
+                    &mut params,
+                )?;
+            }
+        }
+
+        // ── Reduce kernel ──
+        self.ensure_givens4_kernel(
+            "attention_flash_givens4_reduce",
+            kernels::ATTENTION_FLASH_GIVENS4_REDUCE_SRC,
+            "attention_flash_givens4_reduce",
+        )?;
+        {
+            let func = &self.functions["attention_flash_givens4_reduce"];
+            let mut p_ptr = partials.buf.as_ptr();
+            let mut o_ptr = out.buf.as_ptr();
+            let mut ct_ptr = cos_theta.buf.as_ptr();
+            let mut st_ptr = sin_theta.buf.as_ptr();
+            let mut nh = n_heads as i32;
+            let mut hd = head_dim as i32;
+            let mut nt = n_tiles as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &mut p_ptr as *mut _ as *mut c_void,
+                &mut o_ptr as *mut _ as *mut c_void,
+                &mut ct_ptr as *mut _ as *mut c_void,
+                &mut st_ptr as *mut _ as *mut c_void,
+                &mut nh as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void,
+                &mut nt as *mut _ as *mut c_void,
+            ];
+            unsafe {
+                self.hip.launch_kernel(
+                    func,
+                    [n_heads as u32, 1, 1],
+                    [32, 1, 1],
+                    0,
+                    self.stream_ref(),
+                    &mut params,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Flash attention with symmetric turbo4 KV cache — tile + reduce two-kernel path.
+    /// Same tiling as Q8 flash, but FWHT-forward rotates Q in registers and reads
+    /// turbo4 K for dot products. V accumulates in FWHT space; reduce applies inverse.
+    /// Requires signs1/signs2 for FWHT and a pre-allocated `partials` buffer.
+    pub fn attention_flash_turbo4(
+        &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
+        out: &GpuTensor, pos_buf: &DeviceBuffer,
+        signs1: &GpuTensor, signs2: &GpuTensor,
+        seq_len_hint: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
+        partials: &GpuTensor,
+    ) -> HipResult<()> {
+        const TILE_SIZE: usize = 128;
+        let n_tiles = (seq_len_hint + TILE_SIZE - 1) / TILE_SIZE;
+
+        // ── Tile kernel ──
+        self.ensure_turbo_kernel(
+            "attention_flash_turbo4_tile",
+            kernels::ATTENTION_FLASH_TURBO4_TILE_SRC,
+            "attention_flash_turbo4_tile",
+        )?;
+        {
+            let func = &self.functions["attention_flash_turbo4_tile"];
+            let scale = 1.0f32 / (head_dim as f32).sqrt();
+            let mut q_ptr = q.buf.as_ptr();
+            let mut k_ptr = k_cache.buf.as_ptr();
+            let mut v_ptr = v_cache.buf.as_ptr();
+            let mut p_ptr = partials.buf.as_ptr();
+            let mut pos_ptr = pos_buf.as_ptr();
+            let mut s1_ptr = signs1.buf.as_ptr();
+            let mut s2_ptr = signs2.buf.as_ptr();
+            let mut nh = n_heads as i32; let mut nkv = n_kv_heads as i32;
+            let mut hd = head_dim as i32; let mut ms = max_seq as i32;
+            let mut sc = scale; let mut ts = TILE_SIZE as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &mut q_ptr as *mut _ as *mut c_void,
+                &mut k_ptr as *mut _ as *mut c_void,
+                &mut v_ptr as *mut _ as *mut c_void,
+                &mut p_ptr as *mut _ as *mut c_void,
+                &mut pos_ptr as *mut _ as *mut c_void,
+                &mut s1_ptr as *mut _ as *mut c_void,
+                &mut s2_ptr as *mut _ as *mut c_void,
+                &mut nh as *mut _ as *mut c_void,
+                &mut nkv as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void,
+                &mut ms as *mut _ as *mut c_void,
+                &mut sc as *mut _ as *mut c_void,
+                &mut ts as *mut _ as *mut c_void,
+            ];
+            unsafe {
+                self.hip.launch_kernel(
+                    func,
+                    [n_heads as u32, n_tiles as u32, 1],
+                    [32, 1, 1],
+                    (TILE_SIZE * 4) as u32, // scores[tile_size] only — Q in registers
+                    self.stream_ref(),
+                    &mut params,
+                )?;
+            }
+        }
+
+        // ── Reduce kernel ──
+        self.ensure_turbo_kernel(
+            "attention_flash_turbo4_reduce",
+            kernels::ATTENTION_FLASH_TURBO4_REDUCE_SRC,
+            "attention_flash_turbo4_reduce",
+        )?;
+        {
+            let func = &self.functions["attention_flash_turbo4_reduce"];
+            let mut p_ptr = partials.buf.as_ptr();
+            let mut o_ptr = out.buf.as_ptr();
+            let mut s1_ptr = signs1.buf.as_ptr();
+            let mut s2_ptr = signs2.buf.as_ptr();
+            let mut nh = n_heads as i32;
+            let mut hd = head_dim as i32;
+            let mut nt = n_tiles as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &mut p_ptr as *mut _ as *mut c_void,
+                &mut o_ptr as *mut _ as *mut c_void,
+                &mut s1_ptr as *mut _ as *mut c_void,
+                &mut s2_ptr as *mut _ as *mut c_void,
+                &mut nh as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void,
+                &mut nt as *mut _ as *mut c_void,
+            ];
+            unsafe {
+                self.hip.launch_kernel(
+                    func,
+                    [n_heads as u32, 1, 1],
+                    [32, 1, 1],
+                    0,
+                    self.stream_ref(),
+                    &mut params,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// Attention with Q8_0 quantized KV cache.
     pub fn attention_q8_0_kv(
         &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
@@ -3598,6 +4186,7 @@ impl Gpu {
     /// position from positions[b] and rotates the first n_rot dims of every
     /// Q and K head. Q/K are [batch_size × n_heads × head_dim] row-major.
     /// Byte-exact with rope_partial_interleaved_f32 at batch_size=1.
+    #[cfg(feature = "deltanet")]
     pub fn rope_partial_interleaved_f32_batched(
         &mut self,
         q: &GpuTensor, k: &GpuTensor, positions: &GpuTensor,
@@ -4400,6 +4989,7 @@ impl Gpu {
     /// (identical state trajectory to calling the single-token variant N
     /// times). `input` / `q_out` / `k_out` / `v_out` are all [N × stride]
     /// row-major.
+    #[cfg(feature = "deltanet")]
     pub fn conv1d_silu_split_f32_n(
         &mut self,
         q_out: &GpuTensor,

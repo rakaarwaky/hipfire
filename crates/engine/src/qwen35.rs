@@ -1399,7 +1399,7 @@ fn forward_prefill_chunk(
     // differ by dtype and we branch on that at each layer) and (b) a plain
     // Q8_0 KV cache (not hf4v/turbo/asym). If the check fails, FA layers
     // fall back to per-token gather/scatter via run_fa_layer_body.
-    let fa_batched_ok = kv_cache.quant_q8
+    let fa_batched_ok = (kv_cache.quant_q8 || kv_cache.quant_givens4 || kv_cache.quant_givens2)
         && !kv_cache.quant_hf4v
         && !kv_cache.quant_asym
         && kv_cache.quant_turbo == 0
@@ -1671,24 +1671,51 @@ fn forward_prefill_chunk(
                 )?;
 
                 // 6. Batched KV cache writes (per-row positions).
-                gpu.kv_cache_write_q8_0_batched(
-                    &kv_cache.k_gpu[layer_idx], &pbs.fa_k_batch, &pbs.positions,
-                    config.n_kv_heads, config.head_dim, n,
-                )?;
-                gpu.kv_cache_write_q8_0_batched(
-                    &kv_cache.v_gpu[layer_idx], &pbs.fa_v_batch, &pbs.positions,
-                    config.n_kv_heads, config.head_dim, n,
-                )?;
+                if kv_cache.quant_givens2 || kv_cache.quant_givens4 {
+                    let ct = kv_cache.turbo_signs1.as_ref().unwrap();
+                    let st = kv_cache.turbo_signs2.as_ref().unwrap();
+                    if kv_cache.quant_givens2 {
+                        gpu.kv_cache_write_givens2_batched(&kv_cache.k_gpu[layer_idx], &pbs.fa_k_batch, &pbs.positions, ct, st, config.n_kv_heads, config.head_dim, n)?;
+                        gpu.kv_cache_write_givens2_batched(&kv_cache.v_gpu[layer_idx], &pbs.fa_v_batch, &pbs.positions, ct, st, config.n_kv_heads, config.head_dim, n)?;
+                    } else {
+                        gpu.kv_cache_write_givens4_batched(&kv_cache.k_gpu[layer_idx], &pbs.fa_k_batch, &pbs.positions, ct, st, config.n_kv_heads, config.head_dim, n)?;
+                        gpu.kv_cache_write_givens4_batched(&kv_cache.v_gpu[layer_idx], &pbs.fa_v_batch, &pbs.positions, ct, st, config.n_kv_heads, config.head_dim, n)?;
+                    }
+                } else {
+                    gpu.kv_cache_write_q8_0_batched(
+                        &kv_cache.k_gpu[layer_idx], &pbs.fa_k_batch, &pbs.positions,
+                        config.n_kv_heads, config.head_dim, n,
+                    )?;
+                    gpu.kv_cache_write_q8_0_batched(
+                        &kv_cache.v_gpu[layer_idx], &pbs.fa_v_batch, &pbs.positions,
+                        config.n_kv_heads, config.head_dim, n,
+                    )?;
+                }
 
-                // 7. Batched causal attention with Q8_0 KV.
-                // The baseline batched kernel stores scores[max_ctx_len] in
-                // LDS which overflows at ~16K ctx (64 KB limit). When context
-                // is long, fall back to per-position flash tile+reduce which
-                // uses fixed 1 KB LDS regardless of context length.
+                // 7. Batched causal attention.
+                // givens4: always per-position flash (no batched givens4 attention kernel).
+                // Q8: batched kernel unless ctx > 15K (LDS overflow), then per-position flash.
                 const LDS_CTX_LIMIT: usize = 15000;
-                if max_ctx_len > LDS_CTX_LIMIT {
-                    // Per-position flash attention for long-context prefill.
-                    // Loop over batch positions, calling flash for each.
+                if kv_cache.quant_givens2 || kv_cache.quant_givens4 {
+                    let ct = kv_cache.turbo_signs1.as_ref().unwrap();
+                    let st = kv_cache.turbo_signs2.as_ref().unwrap();
+                    if kv_cache.quant_givens2 {
+                        gpu.attention_flash_givens2_batched(
+                            &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
+                            config.n_heads, config.n_kv_heads, config.head_dim,
+                            kv_cache.max_seq, max_ctx_len, n,
+                        )?;
+                    } else {
+                        gpu.attention_flash_givens4_batched(
+                            &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
+                            config.n_heads, config.n_kv_heads, config.head_dim,
+                            kv_cache.max_seq, max_ctx_len, n,
+                        )?;
+                    }
+                } else if max_ctx_len > LDS_CTX_LIMIT {
+                    // Per-position flash Q8 attention for long-context prefill.
                     let q_dim = config.n_heads * config.head_dim;
                     let pos_host = gpu.download_f32(&pbs.positions)?;
                     let pos_buf_tmp = gpu.hip.malloc(4)?;
@@ -1696,7 +1723,6 @@ fn forward_prefill_chunk(
                         let seq_len_b = pos_host[b] as usize + 1;
                         let pos_i32 = pos_host[b] as i32;
                         gpu.hip.memcpy_htod(&pos_buf_tmp, &pos_i32.to_ne_bytes())?;
-                        // Create sub-tensor views via offset
                         let q_b = pbs.fa_q_batch.sub_offset(b * q_dim, q_dim);
                         let out_b = pbs.fa_attn_out_batch.sub_offset(b * q_dim, q_dim);
                         gpu.attention_flash_q8_0(
@@ -1884,6 +1910,30 @@ fn run_fa_layer_body(
             &s.fa_attn_out, &s.pos_buf, s1, s2, pos + 1,
             config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
         )?;
+    } else if kv_cache.quant_givens2 {
+        let ct = kv_cache.turbo_signs1.as_ref().unwrap();
+        let st = kv_cache.turbo_signs2.as_ref().unwrap();
+        gpu.kv_cache_write_givens2_fused(
+            &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+            &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+        gpu.attention_flash_givens2(
+            &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+            &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
+            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+            &s.flash_partials,
+        )?;
+    } else if kv_cache.quant_givens4 {
+        let ct = kv_cache.turbo_signs1.as_ref().unwrap();
+        let st = kv_cache.turbo_signs2.as_ref().unwrap();
+        gpu.kv_cache_write_givens4_fused(
+            &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+            &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+        gpu.attention_flash_givens4(
+            &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+            &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
+            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+            &s.flash_partials,
+        )?;
     } else if kv_cache.quant_turbo > 0 {
         let s1 = kv_cache.turbo_signs1.as_ref().unwrap();
         let s2 = kv_cache.turbo_signs2.as_ref().unwrap();
@@ -1892,8 +1942,17 @@ fn run_fa_layer_body(
                 gpu.kv_cache_write_turbo4_fused(
                     &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                     &s.fa_k, &s.fa_v, &s.pos_buf, s1, s2, config.n_kv_heads, config.head_dim)?;
-                gpu.attention_turbo4_kv(&s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                    &s.fa_attn_out, &s.pos_buf, s1, s2, pos + 1, config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq)?;
+                if (s.use_flash_attn && pos + 1 >= 2048) || pos + 1 > 15000 {
+                    gpu.attention_flash_turbo4(
+                        &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                        &s.fa_attn_out, &s.pos_buf, s1, s2, pos + 1,
+                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                        &s.flash_partials,
+                    )?;
+                } else {
+                    gpu.attention_turbo4_kv(&s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                        &s.fa_attn_out, &s.pos_buf, s1, s2, pos + 1, config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq)?;
+                }
             }
             3 => {
                 gpu.kv_cache_write_turbo3_fused(
@@ -2260,6 +2319,30 @@ fn forward_scratch_layers(
                         &s.fa_attn_out, &s.pos_buf, s1, s2, pos + 1,
                         config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
                     )?;
+                } else if kv_cache.quant_givens2 {
+                    let ct = kv_cache.turbo_signs1.as_ref().unwrap();
+                    let st = kv_cache.turbo_signs2.as_ref().unwrap();
+                    gpu.kv_cache_write_givens2_fused(
+                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                        &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                    gpu.attention_flash_givens2(
+                        &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                        &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
+                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                        &s.flash_partials,
+                    )?;
+                } else if kv_cache.quant_givens4 {
+                    let ct = kv_cache.turbo_signs1.as_ref().unwrap();
+                    let st = kv_cache.turbo_signs2.as_ref().unwrap();
+                    gpu.kv_cache_write_givens4_fused(
+                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                        &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                    gpu.attention_flash_givens4(
+                        &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                        &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
+                        config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                        &s.flash_partials,
+                    )?;
                 } else if kv_cache.quant_turbo > 0 {
                     let s1 = kv_cache.turbo_signs1.as_ref().unwrap();
                     let s2 = kv_cache.turbo_signs2.as_ref().unwrap();
@@ -2268,8 +2351,17 @@ fn forward_scratch_layers(
                             gpu.kv_cache_write_turbo4_fused(
                                 &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                                 &s.fa_k, &s.fa_v, &s.pos_buf, s1, s2, config.n_kv_heads, config.head_dim)?;
-                            gpu.attention_turbo4_kv(&s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                                &s.fa_attn_out, &s.pos_buf, s1, s2, pos + 1, config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq)?;
+                            if (s.use_flash_attn && pos + 1 >= 2048) || pos + 1 > 15000 {
+                                gpu.attention_flash_turbo4(
+                                    &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                                    &s.fa_attn_out, &s.pos_buf, s1, s2, pos + 1,
+                                    config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                                    &s.flash_partials,
+                                )?;
+                            } else {
+                                gpu.attention_turbo4_kv(&s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                                    &s.fa_attn_out, &s.pos_buf, s1, s2, pos + 1, config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq)?;
+                            }
                         }
                         3 => {
                             gpu.kv_cache_write_turbo3_fused(

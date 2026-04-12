@@ -76,7 +76,17 @@ fn main() {
         "asym" => KvCache::new_gpu_asym_q8k_turbo4v(
             &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq
         ).unwrap(),
-        other => panic!("unknown HIPFIRE_KV_MODE: {other}  (use q8|turbo4|turbo4_adaptive|asym)"),
+        "givens4" => KvCache::new_gpu_givens4(
+            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq
+        ).unwrap(),
+        "givens2" => KvCache::new_gpu_givens2(
+            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq
+        ).unwrap(),
+        // Deferred: Q8 prefill → convert → givens4 decode
+        "givens4d" => KvCache::new_gpu_q8(
+            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq
+        ).unwrap(),
+        other => panic!("unknown HIPFIRE_KV_MODE: {other}  (use q8|turbo4|turbo4_adaptive|asym|givens4|givens4d)"),
     };
     let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
     let scratch = Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 128, kv_seq).unwrap();
@@ -101,6 +111,32 @@ fn main() {
     eprintln!("  total: {prefill_ms:.1}ms");
     eprintln!("  tok/s: {prefill_tok_s:.1}");
     eprintln!("  NOTE: first prefill run includes kernel JIT compile cost");
+
+    // === DEFERRED CONVERSION (givens4d only) ===
+    if kv_mode == "givens4d" {
+        eprintln!("\n=== Q8 → givens4 conversion ===");
+        // Create givens4 target cache
+        let mut g4_kv = KvCache::new_gpu_givens4(
+            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq
+        ).unwrap();
+        let ct = g4_kv.turbo_signs1.as_ref().unwrap();
+        let st = g4_kv.turbo_signs2.as_ref().unwrap();
+        let t_conv = std::time::Instant::now();
+        for layer in 0..config.n_layers {
+            gpu.convert_q8_to_givens4(
+                &kv_cache.k_gpu[layer], &kv_cache.v_gpu[layer],
+                &g4_kv.k_gpu[layer], &g4_kv.v_gpu[layer],
+                ct, st,
+                config.n_kv_heads, config.head_dim, prefill_len,
+            ).unwrap();
+        }
+        gpu.hip.device_synchronize().unwrap();
+        let conv_ms = t_conv.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("  converted {prefill_len} positions × {} layers in {conv_ms:.2}ms",
+            config.n_layers);
+        // Swap to givens4 cache for decode
+        kv_cache = g4_kv;
+    }
 
     // Read logits to get a valid next token
     let logits = gpu.download_f32(&scratch.logits).unwrap();

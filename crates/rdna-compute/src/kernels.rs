@@ -373,6 +373,49 @@ pub const ATTENTION_FLASH_Q8_0_TILE_SRC: &str = include_str!("../../../kernels/s
 /// combines across tiles, normalizes, writes final output.
 pub const ATTENTION_FLASH_Q8_0_REDUCE_SRC: &str = include_str!("../../../kernels/src/attention_flash_q8_0_reduce.hip");
 
+/// Givens rotation common header: 2x2 block-diagonal rotation primitives.
+pub const GIVENS_COMMON_SRC: &str = include_str!("../../../kernels/src/givens_common.h");
+
+/// KV cache write for givens4 (Givens rotation + 4-bit centroid quantize).
+pub const KV_CACHE_WRITE_GIVENS4_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_givens4.hip");
+
+/// Flash attention tile kernel for givens4 KV cache (block-diagonal Givens rotation).
+pub const ATTENTION_FLASH_GIVENS4_TILE_SRC: &str = include_str!("../../../kernels/src/attention_flash_givens4_tile.hip");
+
+/// Flash attention reduce for givens4 — 2-pass combine + Givens inverse (register-local).
+pub const ATTENTION_FLASH_GIVENS4_REDUCE_SRC: &str = include_str!("../../../kernels/src/attention_flash_givens4_reduce.hip");
+
+/// Bulk convert Q8_0 KV cache → givens4 format (deferred quantization switch point).
+pub const CONVERT_Q8_TO_GIVENS4_SRC: &str = include_str!("../../../kernels/src/convert_q8_to_givens4.hip");
+
+/// Batched givens4 KV write — processes N positions in one launch for prefill.
+pub const KV_CACHE_WRITE_GIVENS4_BATCHED_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_givens4_batched.hip");
+
+/// Batched flash attention tile for givens4 — processes sub-batch of positions via blockIdx.z.
+pub const ATTENTION_FLASH_GIVENS4_TILE_BATCHED_SRC: &str = include_str!("../../../kernels/src/attention_flash_givens4_tile_batched.hip");
+
+/// Batched flash attention reduce for givens4 — processes sub-batch via blockIdx.y.
+/// Also used by givens2 (reduce is bit-width independent).
+pub const ATTENTION_FLASH_GIVENS4_REDUCE_BATCHED_SRC: &str = include_str!("../../../kernels/src/attention_flash_givens4_reduce_batched.hip");
+
+// ── givens2: 2-bit Givens rotation, 3.8× compression vs Q8 ──
+
+pub const KV_CACHE_WRITE_GIVENS2_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_givens2.hip");
+pub const ATTENTION_FLASH_GIVENS2_TILE_SRC: &str = include_str!("../../../kernels/src/attention_flash_givens2_tile.hip");
+pub const KV_CACHE_WRITE_GIVENS2_BATCHED_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_givens2_batched.hip");
+pub const ATTENTION_FLASH_GIVENS2_TILE_BATCHED_SRC: &str = include_str!("../../../kernels/src/attention_flash_givens2_tile_batched.hip");
+
+/// Flash attention tile kernel for symmetric turbo4 KV (turbo4 K + turbo4 V).
+/// FWHT-forward rotates Q in registers, reads turbo4 K for dot products,
+/// accumulates turbo4 V in FWHT-rotated space. Reduce kernel applies inverse.
+/// Grid: [n_heads, n_tiles]. LDS: tile_size * 4 bytes (scores only).
+pub const ATTENTION_FLASH_TURBO4_TILE_SRC: &str = include_str!("../../../kernels/src/attention_flash_turbo4_tile.hip");
+
+/// Flash attention reduce for turbo4 KV — combines tile partials, normalizes,
+/// then applies fwht_shfl_inverse to convert FWHT-rotated space back to real space.
+/// Grid: [n_heads]. Zero LDS — FWHT inverse uses ds_swizzle_b32 (native RDNA).
+pub const ATTENTION_FLASH_TURBO4_REDUCE_SRC: &str = include_str!("../../../kernels/src/attention_flash_turbo4_reduce.hip");
+
 /// Quantize KV vector to Q8 (int8 symmetric) and write to quantized KV cache.
 /// Per head: [4B f32 scale][head_dim × int8 values] = head_dim + 4 bytes.
 /// For head_dim=128: 132 bytes vs 512 bytes FP32 = 3.88x compression.
